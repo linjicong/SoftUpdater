@@ -201,6 +201,30 @@ function Get-SuInstallDirFromUninstallEntry {
     return $null
 }
 
+function Get-SuExeNameFromUninstallEntry {
+    <# 从 DisplayIcon / UninstallString 提取主程序 exe 文件名（不含扩展名），供最近使用的 ExeHint 第三重匹配 #>
+    param([string]$DisplayIcon, [string]$UninstallString)
+    foreach ($src in @($DisplayIcon, $UninstallString)) {
+        if ([string]::IsNullOrWhiteSpace($src)) { continue }
+        $s = $src.Trim()
+        $exePath = $null
+        if ($s.StartsWith('"')) {
+            $end = $s.IndexOf('"', 1)
+            if ($end -gt 1) { $exePath = $s.Substring(1, $end - 1) }
+        }
+        if (-not $exePath) {
+            $m = [regex]::Match($s, '(?i)^[a-z]:\\[^"]*?\.exe')
+            if ($m.Success) { $exePath = $m.Value }
+        }
+        if ($exePath) {
+            $exePath = $exePath.Trim()
+            if ($exePath -match '(?i)\.(exe|ico),\d+$') { $exePath = $exePath.Substring(0, $exePath.IndexOf(',')) }
+            if ($exePath -match '(?i)\.exe$') { return [System.IO.Path]::GetFileNameWithoutExtension($exePath) }
+        }
+    }
+    return $null
+}
+
 # ============================================================ 纯逻辑：合并
 
 function Merge-SuSoftwareList {
@@ -222,7 +246,7 @@ function Merge-SuSoftwareList {
     if ($null -eq $Directories)     { $Directories = @() }
     if ($null -eq $ScanPaths)       { $ScanPaths = @() }
 
-    function New-SuRow { param($Name, $Id, $Version, $Available, $Catalog, $Location, $Status, $ProductName = $null)
+    function New-SuRow { param($Name, $Id, $Version, $Available, $Catalog, $Location, $Status, $ProductName = $null, $ExeHint = '')
         $hasUpdate = ($Available -and $Version -and (Compare-SuVersion -A $Available -B $Version) -gt 0)
         [pscustomobject]@{
             Selected    = $false
@@ -235,6 +259,7 @@ function Merge-SuSoftwareList {
             HasUpdate   = $hasUpdate
             Status      = $Status
             ProductName = $ProductName
+            ExeHint     = $ExeHint
             LastUsed    = ''
         }
     }
@@ -282,6 +307,11 @@ function Merge-SuSoftwareList {
                     }
                 }
             }
+            # 主程序 exe 名 → 供「最近使用」ExeHint 第三重匹配（位置缺失时仍可命中）
+            if ($reg.ExeHint) {
+                $row = $rows | Where-Object { $_.Id -eq $wp.Id } | Select-Object -First 1
+                if ($row -and -not "$($row.ExeHint)") { $row.ExeHint = "$($reg.ExeHint)" }
+            }
             # 注册表是已安装版本的权威来源：winget COM 对「应用内自更新」的软件可能返回空/过期的本地版本
             if ($reg.Version) {
                 $row = $rows | Where-Object { $_.Id -eq $wp.Id } | Select-Object -First 1
@@ -293,7 +323,7 @@ function Merge-SuSoftwareList {
         }
         else {
             $matchedRegNames.Add($reg.Name)
-            $rows.Add((New-SuRow -Name $reg.Name -Id '' -Version $reg.Version -Available '' -Catalog '系统' -Location "$($reg.InstallDir)" -Status '未识别'))
+            $rows.Add((New-SuRow -Name $reg.Name -Id '' -Version $reg.Version -Available '' -Catalog '系统' -Location "$($reg.InstallDir)" -Status '未识别' -ExeHint "$($reg.ExeHint)"))
         }
     }
 
@@ -382,61 +412,71 @@ function Test-SuPathUnder {
 
 $script:SuGenericExeNames = @('setup', 'install', 'uninstall', 'unins000', 'update', 'updater', 'launcher')
 
-function Update-SuRowsLastUsed {
+function Resolve-SuLastUsedBest {
     <#
-      把 UserAssist 运行记录匹配到软件行，写入 LastUsed（"yyyy-MM-dd HH:mm"，无记录为空）。
+      「最近使用」核心匹配：返回 hashtable（行对象 → 最近运行 [datetime]，未命中无键）。
       匹配规则（每行取最大时间）：
         1) 记录为 .lnk 快捷方式 → 文件名与行名称宽松匹配；
         2) 记录为完整路径 → 其目录位于行的 Location 之下；未命中时回退 exe 名宽松匹配
            （跳过 setup/uninstall 等通用安装器名，避免误匹配）；
-        3) 记录为裸别名（如 AlibabaCloud.Qoder）→ 名称宽松匹配。
-      性能：行的规范化键/别名/位置预先算好，内层循环只做字符串运算
-           （~300 行 × ~250 条记录 逐对调用正则函数会到数秒，预计算后亚秒级）。返回命中的行数。
+        3) 记录为裸别名（如 AlibabaCloud.Qoder）→ 名称宽松匹配；
+        4) ExeHint 第三重匹配：注册表 DisplayIcon 提取的主程序 exe 名与记录名相等。
+      性能：行的规范化键/别名/位置预计算 + 别名/规范名倒排索引（等值命中 O(1)，
+           仅未等值命中的记录回退逐行包含扫描）。
     #>
     param([object[]]$Rows = @(), [object[]]$Entries = @())
-    if ($null -eq $Rows) { $Rows = @() }
-    if ($null -eq $Entries) { $Entries = @() }
     $rows = @($Rows | Where-Object { $null -ne $_ })
-    if ($rows.Count -eq 0) { return 0 }
-    $entries = @($Entries | Where-Object { $null -ne $_ })
-    if ($entries.Count -eq 0) {
-        foreach ($r in $rows) { Set-SuLastUsedCell -Row $r -Text '' }
-        return 0
-    }
+    $best = @{}
+    if ($rows.Count -eq 0) { return $best }
     $genericSet = @{}
     foreach ($g in $script:SuGenericExeNames) { $genericSet[$g] = $true }
-    $best = @{}
     $rowInfo = [System.Collections.Generic.List[object]]::new()
+    $exactIndex = @{}
     foreach ($r in $rows) {
         $best[$r] = $null
-        $rowInfo.Add([pscustomobject]@{
-            Row   = $r
-            Norm  = (ConvertTo-SuNormalizedKey -Text "$($r.Name)")
-            Alias = @(Get-SuAliasKeys -Name "$($r.Name)")
-            Loc   = ("$($r.Location)").TrimEnd('\')
-        })
+        $rk = [pscustomobject]@{
+            Row        = $r
+            Norm       = (ConvertTo-SuNormalizedKey -Text "$($r.Name)")
+            Alias      = @(Get-SuAliasKeys -Name "$($r.Name)")
+            Loc        = ("$($r.Location)").TrimEnd('\')
+            ExeHintNorm = (ConvertTo-SuNormalizedKey -Text "$(Get-PropSafe $r 'ExeHint')")
+        }
+        $rowInfo.Add($rk)
+        foreach ($k in (@($rk.Alias) + @($rk.Norm) + @($rk.ExeHintNorm) | Where-Object { $_ } | Select-Object -Unique)) {
+            if (-not $exactIndex.ContainsKey($k)) { $exactIndex[$k] = [System.Collections.Generic.List[object]]::new() }
+            [void]$exactIndex[$k].Add($rk)
+        }
     }
+    # 包含回退扫描用的并行数组（避免内层循环的脚本块/属性访问开销）
+    $n = $rowInfo.Count
+    $normArr = New-Object 'string[]' $n
+    $itemArr = New-Object 'object[]' $n
+    $i = 0
+    foreach ($rk in $rowInfo) { $normArr[$i] = $rk.Norm; $itemArr[$i] = $rk; $i++ }
 
-    # 名称宽松匹配（与 Test-SuNameMatch 语义一致）：别名键相等 或 规范化后相等 或 短名(≥4)被长名包含
-    $testName = {
-        param($rk, [string]$EntryNorm)
-        if (-not $EntryNorm) { return $false }
-        foreach ($k in $rk.Alias) { if ($k -eq $EntryNorm) { return $true } }
-        $a = $rk.Norm; $b = $EntryNorm
-        if ($a -eq $b) { return $true }
-        $short = if ($a.Length -le $b.Length) { $a } else { $b }
-        $long  = if ($a.Length -le $b.Length) { $b } else { $a }
-        if ($short.Length -ge 4 -and $long.Contains($short)) { return $true }
-        return $false
-    }
     $consider = {
         param($rk, [datetime]$dt)
         $r = $rk.Row
         $cur = $best[$r]
         if ($null -eq $cur -or $dt -gt $cur) { $best[$r] = $dt }
     }
+    # 名称匹配：等值（别名/规范名/ExeHint）走倒排索引 O(1)；包含回退为裸字符串循环。
+    # 两路都执行（并集），与逐行完整谓词的旧语义完全一致。
+    $matchByName = {
+        param([string]$EntryNorm, [datetime]$dt)
+        if (-not $EntryNorm) { return }
+        if ($exactIndex.ContainsKey($EntryNorm)) {
+            foreach ($rk in $exactIndex[$EntryNorm]) { & $consider $rk $dt }
+        }
+        for ($i = 0; $i -lt $n; $i++) {
+            $a = $normArr[$i]
+            if (-not $a) { continue }
+            if (($EntryNorm.Length -ge 4 -and $a.Contains($EntryNorm)) -or
+                ($a.Length -ge 4 -and $EntryNorm.Contains($a))) { & $consider $itemArr[$i] $dt }
+        }
+    }
 
-    foreach ($e in $entries) {
+    foreach ($e in $Entries) {
         $path = "$($e.Path)"
         $dt = $e.LastRun
         if (-not $dt) { continue }
@@ -445,7 +485,7 @@ function Update-SuRowsLastUsed {
             $name = [System.IO.Path]::GetFileNameWithoutExtension($path)
             $kn = ConvertTo-SuNormalizedKey -Text $name
             if ($genericSet.ContainsKey($kn)) { continue }
-            foreach ($rk in $rowInfo) { if (& $testName $rk $kn) { & $consider $rk $dt } }
+            & $matchByName $kn $dt
             continue
         }
         if ($path.Contains('\')) {
@@ -466,15 +506,30 @@ function Update-SuRowsLastUsed {
             $leaf = [System.IO.Path]::GetFileNameWithoutExtension($path)
             $kn = ConvertTo-SuNormalizedKey -Text $leaf
             if ($genericSet.ContainsKey($kn)) { continue }
-            foreach ($rk in $rowInfo) { if (& $testName $rk $kn) { & $consider $rk $dt } }
+            & $matchByName $kn $dt
             continue
         }
         # 裸别名条目（如 MSEdge / AlibabaCloud.Qoder）
         $kn = ConvertTo-SuNormalizedKey -Text $path
         if ($genericSet.ContainsKey($kn)) { continue }
-        foreach ($rk in $rowInfo) { if (& $testName $rk $kn) { & $consider $rk $dt } }
+        & $matchByName $kn $dt
     }
+    return $best
+}
 
+function Update-SuRowsLastUsed {
+    <# 把运行记录匹配到软件行并写入 LastUsed（"yyyy-MM-dd HH:mm"，无记录为空），返回命中的行数。 #>
+    param([object[]]$Rows = @(), [object[]]$Entries = @())
+    if ($null -eq $Rows) { $Rows = @() }
+    if ($null -eq $Entries) { $Entries = @() }
+    $rows = @($Rows | Where-Object { $null -ne $_ })
+    if ($rows.Count -eq 0) { return 0 }
+    $entries = @($Entries | Where-Object { $null -ne $_ })
+    if ($entries.Count -eq 0) {
+        foreach ($r in $rows) { Set-SuLastUsedCell -Row $r -Text '' }
+        return 0
+    }
+    $best = Resolve-SuLastUsedBest -Rows $rows -Entries $entries
     $matched = 0
     foreach ($r in $rows) {
         $dt = $best[$r]
@@ -482,6 +537,35 @@ function Update-SuRowsLastUsed {
         else { Set-SuLastUsedCell -Row $r -Text '' }
     }
     return $matched
+}
+
+function Get-SuLastUsedTextMap {
+    <#
+      快照 → 最近使用文本映射（键："规范名|小写安装目录"），供后台线程计算、UI 线程应用，
+      避免跨线程触碰 WPF 行对象。未命中的行不产生键。
+    #>
+    param([object[]]$Rows = @(), [object[]]$Entries = @())
+    $snap = [System.Collections.Generic.List[object]]::new()
+    foreach ($r in @($Rows)) {
+        if ($null -ne $r) {
+            $snap.Add([pscustomobject]@{
+                Name     = "$($r.Name)"
+                Location = "$($r.Location)"
+                ExeHint  = "$(Get-PropSafe $r 'ExeHint')"
+                LastUsed = ''
+            })
+        }
+    }
+    $best = Resolve-SuLastUsedBest -Rows @($snap) -Entries $Entries
+    $map = @{}
+    foreach ($r in $snap) {
+        $dt = $best[$r]
+        if ($dt) {
+            $key = "$(ConvertTo-SuNormalizedKey -Text $r.Name)|$($r.Location.TrimEnd('\').ToLowerInvariant())"
+            $map[$key] = (Get-Date -Date $dt -Format 'yyyy-MM-dd HH:mm')
+        }
+    }
+    return $map
 }
 
 function Set-SuLastUsedCell {
@@ -619,6 +703,9 @@ function Get-SuRegistrySoftware {
                 Name       = [string]$name
                 Version    = "$(Get-PropSafe $p 'DisplayVersion')"
                 InstallDir = $dir
+                ExeHint    = Get-SuExeNameFromUninstallEntry `
+                    -DisplayIcon   "$(Get-PropSafe $p 'DisplayIcon')" `
+                    -UninstallString "$(Get-PropSafe $p 'UninstallString')"
             })
         }
     }
@@ -721,6 +808,27 @@ function Write-SuLog {
     } catch {}
 }
 
+function Remove-SuOldLogs {
+    <# 清理超过保留期的按天日志（yyyy-MM-dd.log），返回删除数量。挂在每次枚举开头自动滚动清理。 #>
+    param([int]$RetentionDays = 30, [string]$LogDir, [datetime]$Now = (Get-Date))
+    if ($RetentionDays -le 0) { return 0 }
+    if (-not $LogDir) { $LogDir = Join-Path $script:SuRoot 'logs' }
+    $count = 0
+    try {
+        if (-not (Test-Path -LiteralPath $LogDir)) { return 0 }
+        $cutoff = $Now.AddDays(-$RetentionDays)
+        foreach ($f in (Get-ChildItem -LiteralPath $LogDir -File -Filter '*.log' -ErrorAction SilentlyContinue)) {
+            $d = $null
+            if ($f.Name -match '^(\d{4}-\d{2}-\d{2})\.log$') { $d = [datetime]::ParseExact($Matches[1], 'yyyy-MM-dd', $null) }
+            if ($d -and $d -lt $cutoff) {
+                Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+                if (-not (Test-Path -LiteralPath $f.FullName)) { $count++ }
+            }
+        }
+    } catch {}
+    return $count
+}
+
 function Get-SuState {
     param([string]$StatePath)
     if (-not $StatePath) { $StatePath = Join-Path $script:SuRoot 'state.json' }
@@ -738,25 +846,78 @@ function Update-SuState {
     $state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StatePath -Encoding UTF8
 }
 
+# ============================================================ 集成：更新历史
+
+function Get-SuHistoryPath {
+    param([string]$Path)
+    if (-not $Path) { $Path = Join-Path $script:SuRoot 'history.json' }
+    return $Path
+}
+
+function Get-SuHistory {
+    <# 读取更新历史（最多 200 条），文件缺失/损坏返回空数组 #>
+    param([string]$Path)
+    $p = Get-SuHistoryPath -Path $Path
+    if (Test-Path -LiteralPath $p) {
+        try {
+            $v = Get-Content -LiteralPath $p -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($null -ne $v) { return @($v) }
+        } catch { Write-SuLog "更新历史解析失败，按空历史处理: $($_.Exception.Message)" }
+    }
+    return @()
+}
+
+function Add-SuHistoryEntry {
+    <# 追加一条更新历史（自动裁剪到 200 条，保留最新） #>
+    param([string]$Path, [string]$Name, [string]$Id, [string]$FromVersion, [string]$ToVersion, [string]$Result)
+    $p = Get-SuHistoryPath -Path $Path
+    $list = [System.Collections.Generic.List[object]]::new()
+    foreach ($e in (Get-SuHistory -Path $Path)) { $list.Add($e) }
+    $list.Add([pscustomobject]@{
+        Time        = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        Name        = "$Name"
+        Id          = "$Id"
+        FromVersion = "$FromVersion"
+        ToVersion   = "$ToVersion"
+        Result      = "$Result"
+    })
+    while ($list.Count -gt 200) { $list.RemoveAt(0) }
+    try { ConvertTo-Json -InputObject @($list.ToArray()) -Depth 5 | Set-Content -LiteralPath $p -Encoding UTF8 } catch {}
+}
+
 # ============================================================ 集成：完整枚举管线
 
 function Get-SuInstalledSoftware {
     param([hashtable]$Config, [scriptblock]$OnLog = {})
+    $pruned = Remove-SuOldLogs -RetentionDays 30
+    if ($pruned -gt 0) { & $OnLog "已清理 $pruned 个超期日志文件（保留 30 天）" }
+    $swAll = [System.Diagnostics.Stopwatch]::StartNew()
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $wingetPkgs = Get-SuWingetCatalog -OnLog $OnLog
+    $tWinget = $sw.Elapsed.TotalSeconds; $sw.Restart()
     & $OnLog '读取注册表卸载信息...'
     $reg = Get-SuRegistrySoftware
+    $tReg = $sw.Elapsed.TotalSeconds; $sw.Restart()
     & $OnLog '扫描安装目录...'
     $dirs = Get-SuFolderCandidates -ScanPaths $Config.scanPaths
+    $tDirs = $sw.Elapsed.TotalSeconds; $sw.Restart()
     $rows = Merge-SuSoftwareList -WingetPackages $wingetPkgs -RegistryEntries $reg -Directories $dirs -ScanPaths $Config.scanPaths
+    $tMerge = $sw.Elapsed.TotalSeconds; $sw.Restart()
     & $OnLog ("合并完成: 共 {0} 个软件" -f @($rows).Count)
     & $OnLog '读取最近使用记录（UserAssist）...'
+    $tLu = 0.0
     try {
         $ua = @(Get-SuUserAssistEntries)
         $matched = Update-SuRowsLastUsed -Rows @($rows) -Entries $ua
+        $tLu = $sw.Elapsed.TotalSeconds
         & $OnLog ("最近使用: {0} 条运行记录, 匹配 {1} 个软件" -f $ua.Count, $matched)
     } catch {
+        $tLu = $sw.Elapsed.TotalSeconds
         & $OnLog "读取最近使用记录失败（不影响列表）: $($_.Exception.Message)"
     }
+    $swAll.Stop()
+    & $OnLog ("阶段耗时: winget={0:N1}s 注册表={1:N1}s 目录={2:N1}s 合并={3:N1}s 最近使用={4:N1}s 总计={5:N1}s" -f `
+        $tWinget, $tReg, $tDirs, $tMerge, $tLu, $swAll.Elapsed.TotalSeconds)
     return $rows
 }
 
@@ -785,6 +946,37 @@ function Invoke-SuUpgrade {
     return $code
 }
 
+function Resolve-SuRowUpdates {
+    <#
+      升级后目标行校正：用注册表（权威来源）重新取这些行的当前版本，
+      返回 {Name,Id,Version,HasUpdate,Status} 快照列表——由 UI 经队列在主线程应用，避免跨线程改 WPF 对象。
+      仅处理有 Id 的 winget 行（便携/系统行不参与 winget 升级）；注册表为空时返回空结果（不误改）。
+    #>
+    param([object[]]$Targets = @(), [object[]]$RegistryEntries = @())
+    $out = [System.Collections.Generic.List[object]]::new()
+    if ($null -eq $Targets -or @($Targets).Count -eq 0) { return $out }
+    if ($null -eq $RegistryEntries -or @($RegistryEntries).Count -eq 0) { return $out }
+    foreach ($t in @($Targets)) {
+        if ($null -eq $t) { continue }
+        if (-not "$($t.Id)") { continue }
+        $hit = $null
+        foreach ($reg in $RegistryEntries) {
+            if (Test-SuNameMatch -A "$($t.Name)" -B "$($reg.Name)") { $hit = $reg; break }
+        }
+        $version = if ($hit -and "$($hit.Version)") { "$($hit.Version)" } else { "$($t.Version)" }
+        $hasUpdate = ($t.Available -and $version -and (Compare-SuVersion -A "$($t.Available)" -B $version) -gt 0)
+        $status = if (-not $version) { '版本未知' } elseif ($hasUpdate) { '有更新' } else { '最新' }
+        $out.Add([pscustomobject]@{
+            Name      = "$($t.Name)"
+            Id        = "$($t.Id)"
+            Version   = $version
+            HasUpdate = [bool]$hasUpdate
+            Status    = $status
+        })
+    }
+    return $out
+}
+
 function Invoke-SuUpgradeBatch {
     param(
         [object[]]$Rows,
@@ -797,9 +989,16 @@ function Invoke-SuUpgradeBatch {
         if (-not $r.Id) { $skip++; & $OnRowStatus $r '跳过(无winget Id)'; continue }
         if (Test-SuExcluded -Name $r.Name -Id $r.Id -Patterns $Exclusions) { $skip++; & $OnRowStatus $r '跳过(排除名单)'; continue }
         & $OnRowStatus $r '更新中...'
+        $fromVersion = "$($r.Version)"
         $code = Invoke-SuUpgrade -Id $r.Id -Name $r.Name -OnOutput $OnOutput
-        if ($code -eq 0) { $ok++;  & $OnRowStatus $r '成功' }
-        else             { $fail++; & $OnRowStatus $r "失败(退出码 $code)" }
+        if ($code -eq 0) {
+            $ok++;  & $OnRowStatus $r '成功'
+            Add-SuHistoryEntry -Name $r.Name -Id $r.Id -FromVersion $fromVersion -ToVersion "$($r.Available)" -Result '成功'
+        }
+        else {
+            $fail++; & $OnRowStatus $r "失败(退出码 $code)"
+            Add-SuHistoryEntry -Name $r.Name -Id $r.Id -FromVersion $fromVersion -ToVersion "$($r.Available)" -Result "失败(退出码 $code)"
+        }
     }
     return [pscustomobject]@{ Ok = $ok; Fail = $fail; Skip = $skip }
 }
@@ -980,12 +1179,87 @@ function Update-SuPortableDbLearning {
     return $dbList
 }
 
+function Get-SuGithubRepoFromUrl {
+    <# 从 GitHub 安装包/发布页地址推导 owner/repo；非 GitHub → null #>
+    param([string]$Url)
+    if (-not $Url) { return $null }
+    $m = [regex]::Match($Url, '(?i)github\.com/([^/\s]+)/([^/\s/#\?]+)')
+    if (-not $m.Success) { return $null }
+    $repo = "$($m.Groups[2].Value)".TrimEnd('/')
+    if (-not $repo -or $repo -ieq 'releases' -or $repo -ieq 'blob' -or $repo -ieq 'tree') { return $null }
+    return "$($m.Groups[1].Value)/$repo"
+}
+
+function ConvertFrom-SuGithubRelease {
+    <# 解析 GitHub releases/latest 的 JSON：tag 去 v 前缀为版本；资产优先 x64 的 .exe/.msi #>
+    param([string]$JsonText)
+    if ([string]::IsNullOrWhiteSpace($JsonText)) { return $null }
+    try { $j = $JsonText | ConvertFrom-Json } catch { return $null }
+    if (-not $j -or [string]::IsNullOrWhiteSpace("$($j.tag_name)")) { return $null }
+    $tag = "$($j.tag_name)"
+    $ver = $tag -replace '^[vV]', ''
+    $assetUrl = ''
+    $assets = @($j.assets)
+    if ($assets.Count -gt 0) {
+        $pick = $null
+        foreach ($a in $assets) { if ("$($a.name)" -match '(?i)x64|x86_64|win64' -and "$($a.name)" -match '(?i)\.(exe|msi)$') { $pick = $a; break } }
+        if (-not $pick) { foreach ($a in $assets) { if ("$($a.name)" -match '(?i)\.(exe|msi)$') { $pick = $a; break } } }
+        if (-not $pick) { $pick = $assets[0] }
+        $assetUrl = "$($pick.browser_download_url)"
+    }
+    return [pscustomobject]@{ Tag = $tag; Version = $ver; HtmlUrl = "$($j.html_url)"; AssetUrl = $assetUrl }
+}
+
+function Get-SuGithubLatestRelease {
+    <# 查询仓库最新 Release（未认证 API，60 次/时限流；调用方有 TTL 限制） #>
+    param([string]$Repo, [scriptblock]$OnLog = {})
+    try {
+        $client = New-Object System.Net.Http.HttpClient
+        $client.Timeout = [TimeSpan]::FromSeconds(30)
+        $client.DefaultRequestHeaders.UserAgent.ParseAdd('SoftUpdater/1.0')
+        $client.DefaultRequestHeaders.Accept.ParseAdd('application/vnd.github+json')
+        try {
+            $text = $client.GetStringAsync("https://api.github.com/repos/$Repo/releases/latest").GetAwaiter().GetResult()
+        } finally { $client.Dispose() }
+        return ConvertFrom-SuGithubRelease -JsonText $text
+    } catch {
+        & $OnLog "GitHub 查询失败 ($Repo): $($_.Exception.Message)"
+        return $null
+    }
+}
+
 function Invoke-SuPortableCheck {
-    <# 检测管线：对库中过期条目按 Id 查最新版；发现更新时取安装包地址并标记待下载 #>
+    <# 检测管线：对库中过期条目查最新版——有 GithubRepo 的走 GitHub Release，否则按 winget Id；发现更新时取安装包地址并标记待下载 #>
     param([object[]]$Rows, [object[]]$Db = @(), [int]$StaleHours = 24, [switch]$Force, [string]$DbPath, [scriptblock]$OnLog = {})
     if ($null -eq $Db) { $Db = @() }
     $checked = 0
     foreach ($e in $Db) {
+        # GitHub 源：显式 GithubRepo 字段，或从已知 github.com 安装包地址自动推导
+        $repo = "$(Get-PropSafe $e 'GithubRepo')"
+        if (-not $repo -and $e.InstallerUrl) { $repo = Get-SuGithubRepoFromUrl -Url "$($e.InstallerUrl)" }
+        if ($repo) {
+            if (-not $Force -and -not (Test-SuSourceStale -LastChecked "$($e.LastChecked)" -Hours $StaleHours)) { continue }
+            $row = $null
+            foreach ($r in $Rows) { if ($r.Location -and $e.Folder -and ($r.Location.TrimEnd('\') -ieq $e.Folder.TrimEnd('\'))) { $row = $r; break } }
+            if (-not $row) { continue }
+            $checked++
+            & $OnLog ("检测便携更新(GitHub): {0} [{1}]" -f $e.Name, $repo)
+            $rel = Get-SuGithubLatestRelease -Repo $repo -OnLog $OnLog
+            if (-not $rel) { continue }
+            if (-not "$($e.GithubRepo)") { $e | Add-Member -NotePropertyName GithubRepo -NotePropertyValue $repo -Force }
+            $e.LatestVersion = $rel.Version
+            $e.LastChecked = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            # JSON 反序列化的 PSCustomObject 不能直接赋值新属性，必须 Add-Member -Force
+            $e | Add-Member -NotePropertyName PendingDownload -NotePropertyValue $false -Force
+            if ("$($row.Version)") { $e.LocalVersion = "$($row.Version)" }
+            if ($rel.Version -and "$($e.LocalVersion)" -and ((Compare-SuVersion -A $rel.Version -B "$($e.LocalVersion)") -gt 0)) {
+                if ($rel.AssetUrl) { $e.InstallerUrl = $rel.AssetUrl; $e.PendingDownload = $true }
+                if ($rel.HtmlUrl) { $e | Add-Member -NotePropertyName DownloadPage -NotePropertyValue "$($rel.HtmlUrl)" -Force }
+                & $OnLog ("便携更新: {0}  {1} → {2}" -f $e.Name, $e.LocalVersion, $rel.Version)
+            }
+            Save-SuPortableDb -Db $Db -Path $DbPath
+            continue
+        }
         if (-not $e.WingetId) { continue }
         if (-not $Force -and -not (Test-SuSourceStale -LastChecked "$($e.LastChecked)" -Hours $StaleHours)) { continue }
         $row = $null
@@ -1170,5 +1444,8 @@ Export-ModuleMember -Function @(
     'Save-SuRowCache', 'Get-SuRowCache', 'Test-SuCacheFresh',
     'Get-SuStatusBucket', 'Get-SuStatusCounts', 'Get-SuVersionFromMsixId',
     'ConvertFrom-SuRot13', 'Get-SuUserAssistLastRun', 'Test-SuPathUnder',
-    'Update-SuRowsLastUsed', 'Get-SuUserAssistEntries'
+    'Update-SuRowsLastUsed', 'Get-SuUserAssistEntries', 'Get-SuLastUsedTextMap',
+    'Remove-SuOldLogs', 'Get-SuHistory', 'Add-SuHistoryEntry', 'Resolve-SuRowUpdates',
+    'Get-SuGithubRepoFromUrl', 'ConvertFrom-SuGithubRelease', 'Get-SuGithubLatestRelease',
+    'Get-SuExeNameFromUninstallEntry'
 )

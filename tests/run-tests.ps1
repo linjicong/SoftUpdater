@@ -463,6 +463,95 @@ $mg23 = Merge-SuSoftwareList -WingetPackages @(
 Assert-True ($null -ne $mg23[0].PSObject.Properties['LastUsed']) "23.16 合并行携带 LastUsed 字段"
 Assert-Equal '' $mg23[0].LastUsed "23.17 初始为空（待枚举管线填充）"
 
+# ========== 24. 日志自动清理 ==========
+Write-Host "`n[24] 日志清理 Remove-SuOldLogs" -ForegroundColor Cyan
+$tmpLog = Join-Path ([System.IO.Path]::GetTempPath()) ("sulogs_" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $tmpLog | Out-Null
+Set-Content (Join-Path $tmpLog '2026-07-01.log') 'x'
+Set-Content (Join-Path $tmpLog '2026-09-03.log') 'x'
+Set-Content (Join-Path $tmpLog '2026-09-04.log') 'x'
+$n24 = Remove-SuOldLogs -LogDir $tmpLog -RetentionDays 30 -Now (Get-Date '2026-09-04 18:00:00')
+Assert-Equal 1 $n24 "24.1 只清理超期日志"
+Assert-True (-not (Test-Path (Join-Path $tmpLog '2026-07-01.log'))) "24.2 超期文件已删除"
+Assert-True (Test-Path (Join-Path $tmpLog '2026-09-03.log')) "24.3 未超期文件保留"
+Remove-Item -Recurse -Force $tmpLog
+
+# ========== 25. 更新历史 ==========
+Write-Host "`n[25] 更新历史 Add-SuHistoryEntry / Get-SuHistory" -ForegroundColor Cyan
+$histPath = "$env:TEMP\su-history-$PID.json"
+if (Test-Path $histPath) { Remove-Item $histPath -Force }
+Assert-Equal 0 @(Get-SuHistory -Path $histPath).Count "25.1 无历史文件 → 空"
+Add-SuHistoryEntry -Path $histPath -Name 'Git' -Id 'Git.Git' -FromVersion '2.50.1' -ToVersion '2.51.0' -Result '成功'
+Add-SuHistoryEntry -Path $histPath -Name 'App' -Id 'a.b' -FromVersion '1.0' -ToVersion '1.1' -Result '失败(退出码 1)'
+$h25 = @(Get-SuHistory -Path $histPath)
+Assert-Equal 2 $h25.Count "25.2 两条历史按序追加"
+Assert-Equal 'Git' $h25[0].Name "25.3 字段保真"
+Assert-Equal '失败(退出码 1)' $h25[1].Result "25.4 结果保真"
+for ($i = 0; $i -lt 205; $i++) { Add-SuHistoryEntry -Path $histPath -Name "App$i" -Id "x.$i" -FromVersion '1' -ToVersion '2' -Result '成功' }
+Assert-Equal 200 @(Get-SuHistory -Path $histPath).Count "25.5 超过 200 条裁剪"
+Assert-Equal 'App204' @(Get-SuHistory -Path $histPath)[199].Name "25.6 保留最新"
+Remove-Item $histPath -Force
+
+# ========== 26. 更新后目标行注册表校正 ==========
+Write-Host "`n[26] Resolve-SuRowUpdates" -ForegroundColor Cyan
+$rows26 = @(
+    [pscustomobject]@{ Name = 'Cherry Studio'; Id = 'kangfenmao.CherryStudio'; Version = '2.0.11'; Available = '2.0.12'; Catalog = 'winget'; Location = ''; HasUpdate = $true; Status = '有更新' },
+    [pscustomobject]@{ Name = 'Everything'; Id = ''; Version = '1.4.1.1028'; Available = ''; Catalog = '便携'; Location = 'D:\software\EV'; HasUpdate = $false; Status = '最新(便携)' }
+)
+$reg26 = @(
+    [pscustomobject]@{ Name = 'Cherry Studio 2.0.12'; Version = '2.0.12'; InstallDir = '' }
+)
+$upd26 = @(Resolve-SuRowUpdates -Targets $rows26 -RegistryEntries $reg26)
+Assert-Equal 1 $upd26.Count "26.1 只有 winget 行参与校正"
+Assert-Equal '2.0.12' $upd26[0].Version "26.2 版本来自注册表(权威)"
+Assert-Equal '最新' $upd26[0].Status "26.3 升级后状态=最新"
+Assert-True (-not $upd26[0].HasUpdate) "26.4 不再有更新"
+Assert-Equal 'kangfenmao.CherryStudio' $upd26[0].Id "26.5 携带 Id 供 UI 定位"
+$reg26b = @([pscustomobject]@{ Name = 'Cherry Studio 2.0.11'; Version = '2.0.11'; InstallDir = '' })
+$upd26b = @(Resolve-SuRowUpdates -Targets @($rows26[0]) -RegistryEntries $reg26b)
+Assert-Equal '有更新' $upd26b[0].Status "26.6 注册表未见新版本 → 保持有更新"
+$upd26c = @(Resolve-SuRowUpdates -Targets $rows26 -RegistryEntries @())
+Assert-Equal 0 $upd26c.Count "26.7 无注册表数据 → 空结果不误改"
+
+# ========== 27. GitHub Release 解析 ==========
+Write-Host "`n[27] GitHub Release 纯函数" -ForegroundColor Cyan
+Assert-Equal 'clash-verge-rev/clash-verge-rev' (Get-SuGithubRepoFromUrl -Url 'https://github.com/clash-verge-rev/clash-verge-rev/releases/download/v2.4.2/Clash.Verge_2.4.2_x64-setup.exe') "27.1 从安装包地址推导仓库"
+Assert-Null (Get-SuGithubRepoFromUrl -Url 'https://www.voidtools.com/Everything-1.4.1.x64.msi') "27.2 非 GitHub → null"
+$gj27 = '{"tag_name":"v2.4.2","html_url":"https://github.com/o/r/releases/tag/v2.4.2","assets":[{"name":"sources.zip","browser_download_url":"https://x/src.zip"},{"name":"Clash.Verge_2.4.2_x64-setup.exe","browser_download_url":"https://github.com/o/r/releases/download/v2.4.2/setup.exe"}]}'
+$rel27 = ConvertFrom-SuGithubRelease -JsonText $gj27
+Assert-Equal '2.4.2' $rel27.Version "27.3 tag 去 v 前缀"
+Assert-Equal 'https://github.com/o/r/releases/tag/v2.4.2' $rel27.HtmlUrl "27.4 发布页地址"
+Assert-Equal 'https://github.com/o/r/releases/download/v2.4.2/setup.exe' $rel27.AssetUrl "27.5 优先选 x64 exe 资产"
+$rel27b = ConvertFrom-SuGithubRelease -JsonText '{"tag_name":"1.0.0","html_url":"https://github.com/o/r/releases/tag/1.0.0","assets":[]}'
+Assert-Equal '1.0.0' $rel27b.Version "27.6 无 v 前缀照常"
+Assert-Equal '' $rel27b.AssetUrl "27.7 无可用资产 → 空地址"
+Assert-Null (ConvertFrom-SuGithubRelease -JsonText 'not json') "27.8 坏 JSON → null"
+
+# ========== 28. ExeHint 第三重匹配 ==========
+Write-Host "`n[28] ExeHint 匹配" -ForegroundColor Cyan
+Assert-Equal 'Everything' (Get-SuExeNameFromUninstallEntry -DisplayIcon 'D:\software\EV\Everything.exe,0' -UninstallString '') "28.1 DisplayIcon 提取 exe 名"
+Assert-Equal 'MyApp' (Get-SuExeNameFromUninstallEntry -DisplayIcon '' -UninstallString '"C:\Program Files\App\MyApp.exe"') "28.2 带引号卸载串提取"
+Assert-Null (Get-SuExeNameFromUninstallEntry -DisplayIcon '' -UninstallString 'MsiExec.exe /I{12345678-1234-1234-1234-123456789012}') "28.3 MsiExec → null"
+$rows28 = @(
+    [pscustomobject]@{ Name = '极客浏览器'; Location = ''; ExeHint = 'GeekBrowser'; LastUsed = '' },
+    [pscustomobject]@{ Name = 'No Hint'; Location = ''; LastUsed = '' }
+)
+$ents28 = @([pscustomobject]@{ Path = 'C:\Users\x\AppData\Local\GeekBrowser\GeekBrowser.exe'; LastRun = (Get-Date '2026-09-04 10:00:00') })
+Update-SuRowsLastUsed -Rows $rows28 -Entries $ents28 | Out-Null
+Assert-Equal '2026-09-04 10:00' $rows28[0].LastUsed "28.4 ExeHint 相等命中(名称与路径都无法匹配时)"
+Assert-Equal '' $rows28[1].LastUsed "28.5 无 ExeHint 行不受影响"
+
+# ========== 29. 最近使用快照映射（启动后台刷新用） ==========
+Write-Host "`n[29] Get-SuLastUsedTextMap" -ForegroundColor Cyan
+$snap29 = @(
+    [pscustomobject]@{ Name = 'Qoder'; Location = 'D:\software\Qoder\Qoder'; ExeHint = '' },
+    [pscustomobject]@{ Name = 'Everything'; Location = 'D:\software\Everything'; ExeHint = 'Everything' }
+)
+$map29 = Get-SuLastUsedTextMap -Rows $snap29 -Entries $ents23
+Assert-Equal '2026-09-02 11:37' $map29['qoder|d:\software\qoder\qoder'] "29.1 快照映射:目录前缀命中"
+Assert-Equal '2026-09-03 21:00' $map29['everything|d:\software\everything'] "29.2 快照映射:快捷方式名命中"
+Assert-Equal 2 $map29.Count "29.3 未命中不产生键"
+
 # ========== 汇总 ==========
 Write-Host ""
 Write-Host ("=" * 50)

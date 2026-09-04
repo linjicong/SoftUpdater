@@ -33,7 +33,7 @@ if (-not ('SU.SuRow' -as [type])) {
 using System.ComponentModel;
 namespace SU {
     public class SuRow : INotifyPropertyChanged {
-        bool _selected; string _name, _id, _version, _available, _catalog, _location, _status, _downloadPage, _productName, _lastUsed; bool _hasUpdate;
+        bool _selected; string _name, _id, _version, _available, _catalog, _location, _status, _downloadPage, _productName, _lastUsed, _exeHint; bool _hasUpdate;
         public bool Selected { get { return _selected; } set { _selected = value; Notify("Selected"); } }
         public string Name { get { return _name; } set { _name = value; Notify("Name"); } }
         public string Id { get { return _id; } set { _id = value; Notify("Id"); } }
@@ -46,6 +46,7 @@ namespace SU {
         public string DownloadPage { get { return _downloadPage; } set { _downloadPage = value; Notify("DownloadPage"); } }
         public string ProductName { get { return _productName; } set { _productName = value; Notify("ProductName"); } }
         public string LastUsed { get { return _lastUsed; } set { _lastUsed = value; Notify("LastUsed"); } }
+        public string ExeHint { get { return _exeHint; } set { _exeHint = value; Notify("ExeHint"); } }
         public event PropertyChangedEventHandler PropertyChanged;
         void Notify(string p) { var h = PropertyChanged; if (h != null) h(this, new PropertyChangedEventArgs(p)); }
     }
@@ -64,6 +65,7 @@ $sync.ResultRows  = $null
 $sync.StatusText  = '正在启动...'
 $sync.Busy        = $false
 $sync.DlPct       = -1   # >=0 时状态栏显示下载进度条
+$sync.LastUsedMap = $null # 后台最近使用刷新结果（键：规范名|小写位置）
 
 $sync.Log.Enqueue("软件更新助手已启动（管理员: $isAdmin）")
 if ($wingetPath) { $sync.Log.Enqueue("winget: $wingetPath") } else { $sync.Log.Enqueue('警告: 未找到 winget.exe，更新功能不可用') }
@@ -144,13 +146,16 @@ try {
     $Sync.StatusText = "正在更新 $($Targets.Count) 个软件..."
     $Sync.DlPct = -2   # 不定态进度条（winget 升级无细粒度进度）
     $r = Invoke-SuUpgradeBatch -Rows $Targets -Exclusions $Config.exclusions -OnOutput $onOutput -OnRowStatus $onRow
-    $Sync.StatusText = "更新结束: 成功 $($r.Ok) / 失败 $($r.Fail) / 跳过 $($r.Skip)，正在刷新列表..."
-    $rows = @(Get-SuInstalledSoftware -Config $Config -OnLog $onOutput)
-    $Sync.ResultRows = $rows
-    $updCount = @($rows | Where-Object { $_.HasUpdate }).Count
+    # 目标行注册表校正（秒级）代替全量重扫（40s+）：注册表是版本的权威来源；
+    # 校正结果经 RowUpdates 队列在主线程应用。列表全量新鲜度由下次「刷新列表」/定时任务保证。
+    $Sync.StatusText = "更新结束: 成功 $($r.Ok) / 失败 $($r.Fail) / 跳过 $($r.Skip)，校正版本..."
+    $upd = @(Resolve-SuRowUpdates -Targets $Targets -RegistryEntries (Get-SuRegistrySoftware))
+    foreach ($u in $upd) {
+        $Sync.RowUpdates.Enqueue(@{ Name = $u.Name; Id = $u.Id; Status = $u.Status; Version = $u.Version; HasUpdate = $u.HasUpdate })
+    }
     $Sync.DlPct = -1
-    $Sync.StatusText = "更新结束: 成功 $($r.Ok) / 失败 $($r.Fail) / 跳过 $($r.Skip);  共 $($rows.Count) 个软件, $updCount 个有更新"
-    Update-SuState -Data @{ lastCheck = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); lastCount = $rows.Count; lastUpdates = $updCount }
+    $Sync.StatusText = "更新结束: 成功 $($r.Ok) / 失败 $($r.Fail) / 跳过 $($r.Skip)（版本已按注册表校正；更新记录见 history.json）"
+    Update-SuState -Data @{ lastCheck = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') }
 } catch {
     $Sync.Log.Enqueue("更新错误: $($_.Exception.Message)")
     $Sync.StatusText = '更新失败，详见日志'
@@ -226,6 +231,17 @@ try {
 }
 '@
 
+$lastUsedJobText = @'
+param($Root, $Sync, $Snapshot)
+Import-Module (Join-Path $Root 'SoftUpdater-Core.psm1') -Force
+try {
+    $entries = @(Get-SuUserAssistEntries)
+    $Sync.LastUsedMap = Get-SuLastUsedTextMap -Rows $Snapshot -Entries $entries
+} catch {
+    $Sync.Log.Enqueue("最近使用后台刷新失败: $($_.Exception.Message)")
+}
+'@
+
 $downloadPortableJobText = @'
 param($Root, $Config, $Sync, $Folder)
 Import-Module (Join-Path $Root 'SoftUpdater-Core.psm1') -Force
@@ -297,6 +313,7 @@ function ConvertTo-SuRowCollection {
         $row.DownloadPage = [string]$r.DownloadPage
         $row.ProductName  = [string]$r.ProductName
         $row.LastUsed     = [string]$r.LastUsed
+        $row.ExeHint      = [string]$r.ExeHint
         $row.Selected  = $false
         [void]$oc.Add($row)
     }
@@ -306,15 +323,23 @@ function ConvertTo-SuRowCollection {
 function Apply-SuFilter {
     if ($null -eq $grid.ItemsSource) { return }
     $view = [System.ComponentModel.ICollectionView]$grid.Items
-    $view.Filter = switch ($script:FilterMode) {
-        'update'  { [Predicate[object]] { param($it) (Get-SuStatusBucket -HasUpdate ([bool]$it.HasUpdate) -Status "$($it.Status)") -eq 'update' } }
-        'ok'      { [Predicate[object]] { param($it) (Get-SuStatusBucket -HasUpdate ([bool]$it.HasUpdate) -Status "$($it.Status)") -eq 'ok' } }
-        'unknown' { [Predicate[object]] { param($it) (Get-SuStatusBucket -HasUpdate ([bool]$it.HasUpdate) -Status "$($it.Status)") -eq 'unknown' } }
-        default   { $null }
+    # 分类筛选 + 关键字搜索叠加（Contains 大小写不敏感，不用 -like 避免通配符干扰）
+    $view.Filter = [Predicate[object]] {
+        param($it)
+        if ($script:FilterMode -ne 'all') {
+            if ((Get-SuStatusBucket -HasUpdate ([bool]$it.HasUpdate) -Status "$($it.Status)") -ne $script:FilterMode) { return $false }
+        }
+        $k = "$script:SearchText".Trim()
+        if ($k) {
+            if ("$($it.Name)".IndexOf($k, [System.StringComparison]::OrdinalIgnoreCase) -lt 0 -and
+                "$($it.Id)".IndexOf($k, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
+        }
+        return $true
     }
 }
 
 $script:FilterMode = 'all'
+$script:SearchText = ''
 function Update-SuStats {
     $c = Get-SuStatusCounts -Rows $(if ($script:Rows) { @($script:Rows) } else { @() })
     $btnStAll.Content     = "全部 $($c.Total)"
@@ -395,7 +420,10 @@ $xamlText = @'
         <Button x:Name="StUpdate"   Content="有更新 0"   MinWidth="96"  Margin="6,0,0,0" Padding="8,3"/>
         <Button x:Name="StOk"       Content="最新 0"     MinWidth="96"  Margin="6,0,0,0" Padding="8,3"/>
         <Button x:Name="StUnknown"  Content="版本未知 0" MinWidth="110" Margin="6,0,0,0" Padding="8,3"/>
-        <TextBlock Text="点击分类筛选，再点取消" Foreground="#57606A" VerticalAlignment="Center" Margin="12,0,0,0"/>
+        <TextBox x:Name="TxtSearch" Width="190" Margin="14,0,0,0" VerticalContentAlignment="Center"
+                 ToolTip="按名称/ID 过滤（实时生效，与分类筛选叠加）"/>
+        <Button x:Name="BtnClearSearch" Content="✕" MinWidth="30" Margin="4,0,0,0" ToolTip="清除搜索关键字"/>
+        <TextBlock Text="分类筛选 + 关键字搜索可叠加" Foreground="#57606A" VerticalAlignment="Center" Margin="12,0,0,0"/>
       </StackPanel>
     </StackPanel>
 
@@ -533,6 +561,12 @@ $btnStAll.Add_Click({ Set-SuFilterMode 'all' })
 $btnStUpdate.Add_Click({ Set-SuFilterMode 'update' })
 $btnStOk.Add_Click({ Set-SuFilterMode 'ok' })
 $btnStUnknown.Add_Click({ Set-SuFilterMode 'unknown' })
+
+# ---------- 搜索框 ----------
+$txtSearch      = $win.FindName('TxtSearch')
+$btnClearSearch = $win.FindName('BtnClearSearch')
+$txtSearch.Add_TextChanged({ $script:SearchText = $txtSearch.Text; Apply-SuFilter })
+$btnClearSearch.Add_Click({ $txtSearch.Text = '' })   # 清空触发 TextChanged → 重新过滤
 
 $btnLearn.Add_Click({
     if ($sync.Busy) { return }
@@ -754,13 +788,32 @@ $timer.Add_Tick({
             $logBox.AppendText($sb.ToString())
             $logBox.ScrollToEnd()
         }
-        # 行状态（更新进度）
+        # 行状态（更新进度 / 升级后版本校正）
         $u = $null
+        $rowsChanged = $false
         while ($sync.RowUpdates.TryDequeue([ref]$u)) {
             if ($script:Rows) {
                 foreach ($r in $script:Rows) {
                     $match = if ($u['Id']) { $r.Id -eq $u['Id'] } else { $r.Name -eq $u['Name'] }
-                    if ($match) { $r.Status = $u['Status']; break }
+                    if ($match) {
+                        $r.Status = $u['Status']
+                        if ($null -ne $u['Version'])    { $r.Version = [string]$u['Version'] }
+                        if ($null -ne $u['HasUpdate'])  { $r.HasUpdate = [bool]$u['HasUpdate'] }
+                        $rowsChanged = $true
+                        break
+                    }
+                }
+            }
+        }
+        if ($rowsChanged) { Update-SuStats }
+        # 最近使用后台刷新结果（缓存秒开路径；键：规范名|小写位置）
+        if ($sync.LastUsedMap) {
+            $luMap = $sync.LastUsedMap
+            $sync.LastUsedMap = $null
+            if ($script:Rows) {
+                foreach ($r in $script:Rows) {
+                    $luKey = "{0}|{1}" -f (ConvertTo-SuNormalizedKey -Text $r.Name), ([string]$r.Location).TrimEnd('\').ToLowerInvariant()
+                    if ($luMap.ContainsKey($luKey)) { $r.LastUsed = [string]$luMap[$luKey] }
                 }
             }
         }
@@ -823,6 +876,11 @@ if ($cache -and @($cache.Rows).Count -gt 0) {
     $startMsg = "已从缓存加载 $(@($cache.Rows).Count) 个软件（数据时间 $($cache.SavedAt)）" + $(if ($fresh) { '，数据较新未自动重扫；点「刷新列表」可强制' } else { '，缓存已过期，后台自动刷新中...' })
     $sync.StatusText = $startMsg
     $sync.Log.Enqueue($startMsg)
+    if (-not $doScan) {
+        # 不触发全量重扫 → 后台单独刷新「最近使用」列（UserAssist 读取约 0.3s，秒级完成）
+        $snap = @($script:Rows | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Location = $_.Location; ExeHint = $_.ExeHint } })
+        Start-SuJob -Text $lastUsedJobText -JobArgs @($script:Root, $sync, $snap)
+    }
 } elseif ($state['lastCheck']) {
     $sync.StatusText = "上次检测: $($state['lastCheck'])（共 $($state['lastCount']) 个软件, $($state['lastUpdates']) 个有更新）"
 }
