@@ -37,6 +37,7 @@ try {
 "Timer Enabled: $($timer.IsEnabled)"
 "状态栏文本: [$($statusText.Text)]"
 "表格行数: $($grid.Items.Count)"
+"统计块: [$($btnStAll.Content)] [$($btnStUpdate.Content)] [$($btnStOk.Content)] [$($btnStUnknown.Content)]"
 "性能: 最大 tick $($sync.TickMaxMs) ms / 渲染 $($sync.RenderMs) ms"
 "日志区前 600 字符:"
 if ($logBox.Text.Length -gt 0) { $logBox.Text.Substring(0, [Math]::Min(600, $logBox.Text.Length)) } else { '(日志区为空!)' }

@@ -239,8 +239,13 @@ function Merge-SuSoftwareList {
     }
 
     function Find-BestWingetMatch { param($RegName, $Packages)
-        # 先找规范化相等的，再找包含关系的
-        foreach ($wp in $Packages) { if (Test-SuNameMatch -A $wp.Name -B $RegName) { if ((ConvertTo-SuNormalizedKey $wp.Name) -eq (ConvertTo-SuNormalizedKey $RegName)) { return $wp } } }
+        # 1) 规范化相等（含中英别名，如 微信↔WeChat、飞书↔Feishu）；2) 包含关系
+        $keys = @(Get-SuAliasKeys -Name $RegName)
+        foreach ($key in $keys) {
+            foreach ($wp in $Packages) {
+                if ((ConvertTo-SuNormalizedKey -Text $wp.Name) -eq $key) { return $wp }
+            }
+        }
         foreach ($wp in $Packages) { if (Test-SuNameMatch -A $wp.Name -B $RegName) { return $wp } }
         return $null
     }
@@ -256,7 +261,9 @@ function Merge-SuSoftwareList {
 
     # 1) winget 主列表
     foreach ($wp in $WingetPackages) {
-        $rows.Add((New-SuRow -Name $wp.Name -Id $wp.Id -Version $wp.Version -Available $wp.Available -Catalog 'winget' -Location '' -Status ''))
+        $ver = "$($wp.Version)"
+        if (-not $ver) { $ver = Get-SuVersionFromMsixId -Id "$($wp.Id)" }   # MSIX 包版本内嵌在 Id 中
+        $rows.Add((New-SuRow -Name $wp.Name -Id $wp.Id -Version $ver -Available $wp.Available -Catalog 'winget' -Location '' -Status ''))
     }
 
     # 2) 注册表：标注位置 / 补充系统行
@@ -325,6 +332,38 @@ function Merge-SuSoftwareList {
         $final.Add($r)
     }
     return $final
+}
+
+# ============================================================ 纯逻辑：MSIX 版本解析 + 中英别名
+
+function Get-SuVersionFromMsixId {
+    <# MSIX 包的版本内嵌在 Id 全名中：MSIX\<Name>_<版本>_<架构>__<发布者哈希>。
+       取第一个「纯数字点分段」的 token 作为版本；包名含数字段（如 UI.Xaml.2.8）不会误取。 #>
+    param([string]$Id)
+    if (-not $Id -or -not $Id.StartsWith('MSIX\')) { return $null }
+    foreach ($token in ($Id.Substring(5) -split '_')) {
+        if ($token -match '^\d+(\.\d+)+$') { return $token }
+    }
+    return $null
+}
+
+$script:SuNameAliases = @{
+    '微信'     = 'WeChat'
+    '飞书'     = 'Feishu'
+    '腾讯会议' = 'Tencent Meeting'
+    '扣子'     = 'Coze'
+}
+
+function Get-SuAliasKeys {
+    <# 返回名称的规范化匹配键集合：自身 + 已知中英别名 #>
+    param([string]$Name)
+    $keys = [System.Collections.Generic.List[string]]::new()
+    $n = ConvertTo-SuNormalizedKey -Text $Name
+    if ($n) { $keys.Add($n) }
+    foreach ($k in $script:SuNameAliases.Keys) {
+        if ((ConvertTo-SuNormalizedKey -Text $k) -eq $n) { $keys.Add((ConvertTo-SuNormalizedKey -Text $script:SuNameAliases[$k])) }
+    }
+    return $keys
 }
 
 # ============================================================ 集成：发现 winget / 枚举
@@ -868,6 +907,30 @@ function Test-SuCacheFresh {
     try { return ((Get-Date) - [datetime]::Parse($SavedAt)).TotalHours -lt $MaxAgeHours } catch { return $false }
 }
 
+# ============================================================ 纯逻辑：状态分类与统计
+
+function Get-SuStatusBucket {
+    <# 把一行归入统计桶：update=有更新，ok=最新，unknown=版本未知/无法检测/未识别 #>
+    param([bool]$HasUpdate, [string]$Status)
+    if ($HasUpdate) { return 'update' }
+    if ("$Status" -like '最新*') { return 'ok' }
+    return 'unknown'
+}
+
+function Get-SuStatusCounts {
+    param([object[]]$Rows = @())
+    $update = 0; $ok = 0; $unknown = 0
+    foreach ($r in @($Rows)) {
+        if ($null -eq $r) { continue }
+        switch (Get-SuStatusBucket -HasUpdate ([bool]$r.HasUpdate) -Status "$($r.Status)") {
+            'update'  { $update++ }
+            'ok'      { $ok++ }
+            'unknown' { $unknown++ }
+        }
+    }
+    return [pscustomobject]@{ Total = @($Rows).Count; Update = $update; Ok = $ok; Unknown = $unknown }
+}
+
 # ============================================================ 集成：计划任务
 
 function Get-SuScheduledTask {
@@ -908,5 +971,6 @@ Export-ModuleMember -Function @(
     'Test-SuSourceStale', 'Get-SuDownloadFileName', 'Merge-SuPortableSourceInfo',
     'Find-SuWingetCatalogEntry', 'Find-SuWingetCatalogEntryById', 'Get-SuWingetPackageDetail',
     'Update-SuPortableDbLearning', 'Invoke-SuPortableCheck', 'Invoke-SuPortableDownload',
-    'Save-SuRowCache', 'Get-SuRowCache', 'Test-SuCacheFresh'
+    'Save-SuRowCache', 'Get-SuRowCache', 'Test-SuCacheFresh',
+    'Get-SuStatusBucket', 'Get-SuStatusCounts', 'Get-SuVersionFromMsixId'
 )

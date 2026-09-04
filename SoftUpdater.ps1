@@ -302,10 +302,34 @@ function ConvertTo-SuRowCollection {
 }
 
 function Apply-SuFilter {
-    if ($script:Rows) {
-        $view = [System.ComponentModel.ICollectionView]$grid.Items
-        $view.Filter = if ($chkOnly.IsChecked) { [Predicate[object]]{ param($item) $item.HasUpdate } } else { $null }
+    if ($null -eq $grid.ItemsSource) { return }
+    $view = [System.ComponentModel.ICollectionView]$grid.Items
+    $view.Filter = switch ($script:FilterMode) {
+        'update'  { [Predicate[object]] { param($it) (Get-SuStatusBucket -HasUpdate ([bool]$it.HasUpdate) -Status "$($it.Status)") -eq 'update' } }
+        'ok'      { [Predicate[object]] { param($it) (Get-SuStatusBucket -HasUpdate ([bool]$it.HasUpdate) -Status "$($it.Status)") -eq 'ok' } }
+        'unknown' { [Predicate[object]] { param($it) (Get-SuStatusBucket -HasUpdate ([bool]$it.HasUpdate) -Status "$($it.Status)") -eq 'unknown' } }
+        default   { $null }
     }
+}
+
+$script:FilterMode = 'all'
+function Update-SuStats {
+    $c = Get-SuStatusCounts -Rows $(if ($script:Rows) { @($script:Rows) } else { @() })
+    $btnStAll.Content     = "全部 $($c.Total)"
+    $btnStUpdate.Content  = "有更新 $($c.Update)"
+    $btnStOk.Content      = "最新 $($c.Ok)"
+    $btnStUnknown.Content = "版本未知 $($c.Unknown)"
+}
+
+function Set-SuFilterMode {
+    param([string]$Mode)
+    $script:FilterMode = $Mode
+    $normal = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.ColorConverter]::ConvertFromString('#FFFFFF'))
+    $active = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.ColorConverter]::ConvertFromString('#D6E7FF'))
+    foreach ($pair in @(@('all', $btnStAll), @('update', $btnStUpdate), @('ok', $btnStOk), @('unknown', $btnStUnknown))) {
+        $pair[1].Background = if ($pair[0] -eq $Mode) { $active } else { $normal }
+    }
+    Apply-SuFilter
 }
 
 # ---------- XAML ----------
@@ -355,14 +379,22 @@ $xamlText = @'
       <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
 
-    <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,8">
-      <Button x:Name="BtnRefresh" Content="🔄 刷新列表" MinWidth="110"/>
-      <Button x:Name="BtnUpdateSelected" Content="⬆ 更新选中" MinWidth="110" Margin="8,0,0,0"/>
-      <Button x:Name="BtnUpdateAll" Content="⬆⬆ 全部更新" MinWidth="110" Margin="8,0,0,0"/>
-      <Button x:Name="BtnLearnPortable" Content="📚 学习便携源" MinWidth="120" Margin="12,0,0,0"/>
-      <Button x:Name="BtnCheckPortable" Content="⬇ 检测便携更新" MinWidth="130" Margin="8,0,0,0"/>
-      <CheckBox x:Name="ChkOnlyUpdates" Content="只看有更新" Foreground="#1F2328" VerticalAlignment="Center" Margin="18,0,0,0"/>
-      <Button x:Name="BtnSettings" Content="⚙ 设置" MinWidth="90" Margin="18,0,0,0" HorizontalAlignment="Right"/>
+    <StackPanel Grid.Row="0">
+      <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+        <Button x:Name="BtnRefresh" Content="🔄 刷新列表" MinWidth="110"/>
+        <Button x:Name="BtnUpdateSelected" Content="⬆ 更新选中" MinWidth="110" Margin="8,0,0,0"/>
+        <Button x:Name="BtnUpdateAll" Content="⬆⬆ 全部更新" MinWidth="110" Margin="8,0,0,0"/>
+        <Button x:Name="BtnLearnPortable" Content="📚 学习便携源" MinWidth="120" Margin="12,0,0,0"/>
+        <Button x:Name="BtnCheckPortable" Content="⬇ 检测便携更新" MinWidth="130" Margin="8,0,0,0"/>
+        <Button x:Name="BtnSettings" Content="⚙ 设置" MinWidth="90" Margin="12,0,0,0" HorizontalAlignment="Right"/>
+      </StackPanel>
+      <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+        <Button x:Name="StAll"      Content="全部 0"     MinWidth="96"  Padding="8,3"/>
+        <Button x:Name="StUpdate"   Content="有更新 0"   MinWidth="96"  Margin="6,0,0,0" Padding="8,3"/>
+        <Button x:Name="StOk"       Content="最新 0"     MinWidth="96"  Margin="6,0,0,0" Padding="8,3"/>
+        <Button x:Name="StUnknown"  Content="版本未知 0" MinWidth="110" Margin="6,0,0,0" Padding="8,3"/>
+        <TextBlock Text="点击分类筛选，再点取消" Foreground="#57606A" VerticalAlignment="Center" Margin="12,0,0,0"/>
+      </StackPanel>
     </StackPanel>
 
     <DataGrid x:Name="Grid" Grid.Row="1" AutoGenerateColumns="False" CanUserAddRows="False" CanUserDeleteRows="False"
@@ -442,7 +474,10 @@ $btnRefresh      = $win.FindName('BtnRefresh')
 $btnUpdateSel    = $win.FindName('BtnUpdateSelected')
 $btnUpdateAll    = $win.FindName('BtnUpdateAll')
 $btnSettings     = $win.FindName('BtnSettings')
-$chkOnly         = $win.FindName('ChkOnlyUpdates')
+$btnStAll        = $win.FindName('StAll')
+$btnStUpdate     = $win.FindName('StUpdate')
+$btnStOk         = $win.FindName('StOk')
+$btnStUnknown    = $win.FindName('StUnknown')
 $grid            = $win.FindName('Grid')
 $logBox          = $win.FindName('LogBox')
 $statusText      = $win.FindName('StatusText')
@@ -454,6 +489,8 @@ $btnLearn        = $win.FindName('BtnLearnPortable')
 $btnCheckP       = $win.FindName('BtnCheckPortable')
 $dlProgress      = $win.FindName('DlProgress')
 $script:Rows     = $null
+Update-SuStats
+Set-SuFilterMode 'all'
 
 # ---------- 事件 ----------
 $btnRefresh.Add_Click({
@@ -489,7 +526,10 @@ $btnUpdateAll.Add_Click({
     }
 })
 
-$chkOnly.Add_Click({ Apply-SuFilter })
+$btnStAll.Add_Click({ Set-SuFilterMode 'all' })
+$btnStUpdate.Add_Click({ Set-SuFilterMode 'update' })
+$btnStOk.Add_Click({ Set-SuFilterMode 'ok' })
+$btnStUnknown.Add_Click({ Set-SuFilterMode 'unknown' })
 
 $btnLearn.Add_Click({
     if ($sync.Busy) { return }
@@ -731,6 +771,7 @@ $timer.Add_Tick({
             Apply-SuFilter
             $sync.RenderMs = [math]::Round($renderSw.Elapsed.TotalMilliseconds)
             if ($sync.RenderMs -gt 500) { Write-SuLog -Message ("UI 渲染耗时偏高: {0} ms（{1} 行）" -f $sync.RenderMs, @($rows).Count) }
+            Update-SuStats
         }
         # 状态栏与按钮
         if ($sync.StatusText) { $statusText.Text = $sync.StatusText }
@@ -773,6 +814,7 @@ if ($cache -and @($cache.Rows).Count -gt 0) {
     # 缓存秒开
     $script:Rows = ConvertTo-SuRowCollection -Rows @($cache.Rows)
     $grid.ItemsSource = $script:Rows
+    Update-SuStats
     $fresh = Test-SuCacheFresh -SavedAt $cache.SavedAt -MaxAgeHours $maxAge
     $doScan = -not $fresh
     $startMsg = "已从缓存加载 $(@($cache.Rows).Count) 个软件（数据时间 $($cache.SavedAt)）" + $(if ($fresh) { '，数据较新未自动重扫；点「刷新列表」可强制' } else { '，缓存已过期，后台自动刷新中...' })

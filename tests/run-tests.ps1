@@ -339,6 +339,52 @@ $mys = @($mg19 | Where-Object Name -eq 'Mystery App')[0]
 Assert-True (-not $mys.HasUpdate) "19.1 空版本且无注册表兜底 → 不误报有更新"
 Assert-Equal '版本未知' $mys.Status "19.2 状态=版本未知"
 
+# ========== 21. MSIX Id 版本解析 + 中英别名合并 ==========
+Write-Host "`n[21] MSIX 版本解析与别名合并" -ForegroundColor Cyan
+Assert-Equal '1.14.9.29743' (Get-SuVersionFromMsixId -Id 'MSIX\3A48D7FC-AEE2-4CBC-91D1-0007951B8006_1.14.9.29743_x64__yyj3t4bx8qhke') "21.1 标准全名提取"
+Assert-Equal '8.2511.26001.0' (Get-SuVersionFromMsixId -Id 'MSIX\Microsoft.UI.Xaml.2.8_8.2511.26001.0_x64__8wekyb3d8bbwe') "21.2 包名含数字段不误取"
+Assert-Equal '26.26.2459.0' (Get-SuVersionFromMsixId -Id 'MSIX\AppUp.IntelArcSoftware_26.26.2459.0_x64__8j3eq9eme6ctt') "21.3 Intel 驱动包"
+Assert-Null (Get-SuVersionFromMsixId -Id 'MSIX\NoVersionSegment') "21.4 无版本段 → null"
+Assert-Null (Get-SuVersionFromMsixId -Id 'Git.Git') "21.5 非 MSIX Id → null"
+$mg21 = Merge-SuSoftwareList -WingetPackages @(
+    [pscustomobject]@{ Name = 'Intel Arc Software'; Id = 'MSIX\AppUp.IntelArcSoftware_26.26.2459.0_x64__8j3eq9eme6ctt'; Version = ''; Available = ''; Source = 'winget' }
+) -RegistryEntries @() -Directories @() -ScanPaths @()
+$intel = @($mg21 | Where-Object Name -eq 'Intel Arc Software')[0]
+Assert-Equal '26.26.2459.0' $intel.Version "21.6 MSIX 行版本从 Id 填充"
+Assert-Equal '最新' $intel.Status "21.7 填充后归入最新"
+$mg22 = Merge-SuSoftwareList -WingetPackages @(
+    [pscustomobject]@{ Name = 'WeChat'; Id = 'Tencent.WeChat.Universal'; Version = ''; Available = '4.1.13.12'; Source = 'winget' }
+) -RegistryEntries @(
+    [pscustomobject]@{ Name = '微信'; Version = '4.1.0.14'; InstallDir = 'D:\software\Tencent\Weixin' }
+) -Directories @() -ScanPaths @('D:\software')
+Assert-Equal 1 @($mg22).Count "22.1 中英别名合并 → 只剩一行"
+$wx = @($mg22 | Where-Object Name -eq 'WeChat')[0]
+Assert-Equal '4.1.0.14' $wx.Version "22.2 别名命中后注册表版本覆盖"
+Assert-True $wx.HasUpdate "22.3 微信 4.1.0.14 → 4.1.13.12 有更新"
+
+# ========== 20. 状态分类与统计 ==========
+Write-Host "`n[20] 状态分类与统计" -ForegroundColor Cyan
+Assert-Equal 'update'  (Get-SuStatusBucket -HasUpdate $true  -Status '有更新')       "20.1 winget 有更新"
+Assert-Equal 'ok'      (Get-SuStatusBucket -HasUpdate $false -Status '最新')         "20.2 winget 最新"
+Assert-Equal 'unknown' (Get-SuStatusBucket -HasUpdate $false -Status '版本未知')     "20.3 winget 版本未知"
+Assert-Equal 'update'  (Get-SuStatusBucket -HasUpdate $true  -Status '有更新(便携)') "20.4 便携有更新"
+Assert-Equal 'ok'      (Get-SuStatusBucket -HasUpdate $false -Status '最新(便携)')   "20.5 便携最新"
+Assert-Equal 'unknown' (Get-SuStatusBucket -HasUpdate $false -Status '无法检测更新')  "20.6 便携无法检测"
+Assert-Equal 'unknown' (Get-SuStatusBucket -HasUpdate $false -Status '未识别')        "20.7 系统未识别"
+$rows20 = @(
+    [pscustomobject]@{ Name = 'A'; HasUpdate = $true;  Status = '有更新' },
+    [pscustomobject]@{ Name = 'B'; HasUpdate = $true;  Status = '有更新(便携)' },
+    [pscustomobject]@{ Name = 'C'; HasUpdate = $false; Status = '最新' },
+    [pscustomobject]@{ Name = 'D'; HasUpdate = $false; Status = '版本未知' },
+    [pscustomobject]@{ Name = 'E'; HasUpdate = $false; Status = '无法检测更新' }
+)
+$cnt20 = Get-SuStatusCounts -Rows $rows20
+Assert-Equal 5 $cnt20.Total   "20.8 总数"
+Assert-Equal 2 $cnt20.Update  "20.9 有更新计数"
+Assert-Equal 1 $cnt20.Ok      "20.10 最新计数"
+Assert-Equal 2 $cnt20.Unknown "20.11 版本未知计数"
+Assert-Equal 0 (Get-SuStatusCounts -Rows @()).Total "20.12 空行集 → 全 0"
+
 # ========== 汇总 ==========
 Write-Host ""
 Write-Host ("=" * 50)
