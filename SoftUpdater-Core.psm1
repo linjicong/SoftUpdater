@@ -235,6 +235,7 @@ function Merge-SuSoftwareList {
             HasUpdate   = $hasUpdate
             Status      = $Status
             ProductName = $ProductName
+            LastUsed    = ''
         }
     }
 
@@ -332,6 +333,193 @@ function Merge-SuSoftwareList {
         $final.Add($r)
     }
     return $final
+}
+
+# ============================================================ 纯逻辑：UserAssist 最近使用时间
+
+function ConvertFrom-SuRot13 {
+    <# UserAssist 注册表值名为 ROT13 编码的路径，解码（ROT13 自反，数字/符号不变） #>
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    $chars = $Text.ToCharArray()
+    for ($i = 0; $i -lt $chars.Length; $i++) {
+        $c = [int]$chars[$i]
+        if     ($c -ge 65 -and $c -le 90)  { $chars[$i] = [char](($c - 65 + 13) % 26 + 65) }
+        elseif ($c -ge 97 -and $c -le 122) { $chars[$i] = [char](($c - 97 + 13) % 26 + 97) }
+    }
+    return -join $chars
+}
+
+function Get-SuUserAssistLastRun {
+    <#
+      从 UserAssist 记录的二进制数据中提取最近运行时间。
+      Win10/11 记录为 72 字节，LastExecution(FILETIME) 位于偏移 60（非 8 字节对齐）；
+      为兼容未来布局变化，扫描所有字节偏移，取「合理」FILETIME 的最大值。
+      合理 = 2015 之后（滤掉计数字段误判与 UEME 控制会话条目）且不超过明天（滤掉异常值）。
+    #>
+    param([byte[]]$Data, [datetime]$Now = (Get-Date))
+    if (-not $Data -or $Data.Length -lt 8) { return $null }
+    $minFt = [DateTime]::new(2015, 1, 1, 0, 0, 0, [DateTimeKind]::Utc).ToFileTimeUtc()
+    $maxFt = $Now.ToFileTimeUtc() + [TimeSpan]::FromDays(1).Ticks
+    $bestFt = [long]0
+    for ($off = 0; $off -le $Data.Length - 8; $off++) {
+        $ft = [BitConverter]::ToInt64($Data, $off)
+        if ($ft -ge $minFt -and $ft -le $maxFt -and $ft -gt $bestFt) { $bestFt = $ft }
+    }
+    if ($bestFt -gt 0) { return [DateTime]::FromFileTime($bestFt) }
+    return $null
+}
+
+function Test-SuPathUnder {
+    <# 子路径是否位于父目录之下（或相等），大小写不敏感 #>
+    param([string]$Child, [string]$Parent)
+    if (-not $Child -or -not $Parent) { return $false }
+    $c = $Child.TrimEnd('\'); $p = $Parent.TrimEnd('\')
+    if (-not $c -or -not $p) { return $false }
+    if ($c -eq $p) { return $true }
+    return $c.StartsWith($p + '\', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+$script:SuGenericExeNames = @('setup', 'install', 'uninstall', 'unins000', 'update', 'updater', 'launcher')
+
+function Update-SuRowsLastUsed {
+    <#
+      把 UserAssist 运行记录匹配到软件行，写入 LastUsed（"yyyy-MM-dd HH:mm"，无记录为空）。
+      匹配规则（每行取最大时间）：
+        1) 记录为 .lnk 快捷方式 → 文件名与行名称宽松匹配；
+        2) 记录为完整路径 → 其目录位于行的 Location 之下；未命中时回退 exe 名宽松匹配
+           （跳过 setup/uninstall 等通用安装器名，避免误匹配）；
+        3) 记录为裸别名（如 AlibabaCloud.Qoder）→ 名称宽松匹配。
+      性能：行的规范化键/别名/位置预先算好，内层循环只做字符串运算
+           （~300 行 × ~250 条记录 逐对调用正则函数会到数秒，预计算后亚秒级）。返回命中的行数。
+    #>
+    param([object[]]$Rows = @(), [object[]]$Entries = @())
+    if ($null -eq $Rows) { $Rows = @() }
+    if ($null -eq $Entries) { $Entries = @() }
+    $rows = @($Rows | Where-Object { $null -ne $_ })
+    if ($rows.Count -eq 0) { return 0 }
+    $entries = @($Entries | Where-Object { $null -ne $_ })
+    if ($entries.Count -eq 0) {
+        foreach ($r in $rows) { Set-SuLastUsedCell -Row $r -Text '' }
+        return 0
+    }
+    $genericSet = @{}
+    foreach ($g in $script:SuGenericExeNames) { $genericSet[$g] = $true }
+    $best = @{}
+    $rowInfo = [System.Collections.Generic.List[object]]::new()
+    foreach ($r in $rows) {
+        $best[$r] = $null
+        $rowInfo.Add([pscustomobject]@{
+            Row   = $r
+            Norm  = (ConvertTo-SuNormalizedKey -Text "$($r.Name)")
+            Alias = @(Get-SuAliasKeys -Name "$($r.Name)")
+            Loc   = ("$($r.Location)").TrimEnd('\')
+        })
+    }
+
+    # 名称宽松匹配（与 Test-SuNameMatch 语义一致）：别名键相等 或 规范化后相等 或 短名(≥4)被长名包含
+    $testName = {
+        param($rk, [string]$EntryNorm)
+        if (-not $EntryNorm) { return $false }
+        foreach ($k in $rk.Alias) { if ($k -eq $EntryNorm) { return $true } }
+        $a = $rk.Norm; $b = $EntryNorm
+        if ($a -eq $b) { return $true }
+        $short = if ($a.Length -le $b.Length) { $a } else { $b }
+        $long  = if ($a.Length -le $b.Length) { $b } else { $a }
+        if ($short.Length -ge 4 -and $long.Contains($short)) { return $true }
+        return $false
+    }
+    $consider = {
+        param($rk, [datetime]$dt)
+        $r = $rk.Row
+        $cur = $best[$r]
+        if ($null -eq $cur -or $dt -gt $cur) { $best[$r] = $dt }
+    }
+
+    foreach ($e in $entries) {
+        $path = "$($e.Path)"
+        $dt = $e.LastRun
+        if (-not $dt) { continue }
+        if ($path.EndsWith('.lnk', [System.StringComparison]::OrdinalIgnoreCase)) {
+            # 快捷方式条目：{GUID}\TaskBar\Xxx.lnk / 开始菜单路径 → 按文件名匹配
+            $name = [System.IO.Path]::GetFileNameWithoutExtension($path)
+            $kn = ConvertTo-SuNormalizedKey -Text $name
+            if ($genericSet.ContainsKey($kn)) { continue }
+            foreach ($rk in $rowInfo) { if (& $testName $rk $kn) { & $consider $rk $dt } }
+            continue
+        }
+        if ($path.Contains('\')) {
+            # 完整 exe 路径：目录前缀匹配 Location 最准；未命中回退 exe 名（滤通用名）
+            $dir = $null
+            try { $dir = ([System.IO.Path]::GetDirectoryName($path)).TrimEnd('\') } catch {}
+            $hit = $false
+            if ($dir) {
+                foreach ($rk in $rowInfo) {
+                    $loc = $rk.Loc
+                    if (-not $loc) { continue }
+                    if ($dir -eq $loc -or $dir.StartsWith($loc + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+                        & $consider $rk $dt; $hit = $true
+                    }
+                }
+            }
+            if ($hit) { continue }
+            $leaf = [System.IO.Path]::GetFileNameWithoutExtension($path)
+            $kn = ConvertTo-SuNormalizedKey -Text $leaf
+            if ($genericSet.ContainsKey($kn)) { continue }
+            foreach ($rk in $rowInfo) { if (& $testName $rk $kn) { & $consider $rk $dt } }
+            continue
+        }
+        # 裸别名条目（如 MSEdge / AlibabaCloud.Qoder）
+        $kn = ConvertTo-SuNormalizedKey -Text $path
+        if ($genericSet.ContainsKey($kn)) { continue }
+        foreach ($rk in $rowInfo) { if (& $testName $rk $kn) { & $consider $rk $dt } }
+    }
+
+    $matched = 0
+    foreach ($r in $rows) {
+        $dt = $best[$r]
+        if ($dt) { Set-SuLastUsedCell -Row $r -Text (Get-Date -Date $dt -Format 'yyyy-MM-dd HH:mm'); $matched++ }
+        else { Set-SuLastUsedCell -Row $r -Text '' }
+    }
+    return $matched
+}
+
+function Set-SuLastUsedCell {
+    <# 安全写入 LastUsed：旧缓存/外部行可能没有该属性（JSON 反序列化对象直接赋值新属性不可靠，走 Add-Member） #>
+    param([object]$Row, [string]$Text)
+    if (-not $Row.PSObject.Properties['LastUsed']) {
+        $Row | Add-Member -NotePropertyName LastUsed -NotePropertyValue $Text
+        return
+    }
+    $Row.LastUsed = $Text
+}
+
+function Get-SuUserAssistEntries {
+    <#
+      集成：读取 HKCU UserAssist 运行记录（Windows 对「资源管理器/开始菜单/任务栏」启动的程序自动记录）。
+      覆盖 {CEBFF5CD...}（可执行文件）与 {F4E57C4B...}（快捷方式）两个键。
+      返回带有效时间的条目：{ Path = 解码后的路径或名称; LastRun = [datetime] }
+    #>
+    $root = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist'
+    $guids = @(
+        '{CEBFF5CD-ACE2-4F4F-9178-9926F41749EA}',
+        '{F4E57C4B-2036-45F0-A9AB-443BCFE33D9F}'
+    )
+    $now = Get-Date
+    $out = [System.Collections.Generic.List[object]]::new()
+    foreach ($g in $guids) {
+        $key = Get-Item -LiteralPath (Join-Path $root "$g\Count") -ErrorAction SilentlyContinue
+        if (-not $key) { continue }
+        foreach ($vn in $key.GetValueNames()) {
+            $path = ConvertFrom-SuRot13 -Text ("$vn".TrimEnd([char]0))
+            if (-not $path) { continue }
+            $data = $key.GetValue($vn)
+            if ($data -isnot [byte[]]) { continue }
+            $run = Get-SuUserAssistLastRun -Data $data -Now $now
+            if ($run) { $out.Add([pscustomobject]@{ Path = $path; LastRun = $run }) }
+        }
+    }
+    return $out
 }
 
 # ============================================================ 纯逻辑：MSIX 版本解析 + 中英别名
@@ -561,6 +749,14 @@ function Get-SuInstalledSoftware {
     $dirs = Get-SuFolderCandidates -ScanPaths $Config.scanPaths
     $rows = Merge-SuSoftwareList -WingetPackages $wingetPkgs -RegistryEntries $reg -Directories $dirs -ScanPaths $Config.scanPaths
     & $OnLog ("合并完成: 共 {0} 个软件" -f @($rows).Count)
+    & $OnLog '读取最近使用记录（UserAssist）...'
+    try {
+        $ua = @(Get-SuUserAssistEntries)
+        $matched = Update-SuRowsLastUsed -Rows @($rows) -Entries $ua
+        & $OnLog ("最近使用: {0} 条运行记录, 匹配 {1} 个软件" -f $ua.Count, $matched)
+    } catch {
+        & $OnLog "读取最近使用记录失败（不影响列表）: $($_.Exception.Message)"
+    }
     return $rows
 }
 
@@ -972,5 +1168,7 @@ Export-ModuleMember -Function @(
     'Find-SuWingetCatalogEntry', 'Find-SuWingetCatalogEntryById', 'Get-SuWingetPackageDetail',
     'Update-SuPortableDbLearning', 'Invoke-SuPortableCheck', 'Invoke-SuPortableDownload',
     'Save-SuRowCache', 'Get-SuRowCache', 'Test-SuCacheFresh',
-    'Get-SuStatusBucket', 'Get-SuStatusCounts', 'Get-SuVersionFromMsixId'
+    'Get-SuStatusBucket', 'Get-SuStatusCounts', 'Get-SuVersionFromMsixId',
+    'ConvertFrom-SuRot13', 'Get-SuUserAssistLastRun', 'Test-SuPathUnder',
+    'Update-SuRowsLastUsed', 'Get-SuUserAssistEntries'
 )

@@ -385,6 +385,84 @@ Assert-Equal 1 $cnt20.Ok      "20.10 最新计数"
 Assert-Equal 2 $cnt20.Unknown "20.11 版本未知计数"
 Assert-Equal 0 (Get-SuStatusCounts -Rows @()).Total "20.12 空行集 → 全 0"
 
+# ========== 23. UserAssist 最近使用时间 ==========
+Write-Host "`n[23] UserAssist 最近使用时间" -ForegroundColor Cyan
+
+# --- ROT13 解码 ---
+Assert-Equal 'Qoder' (ConvertFrom-SuRot13 -Text 'Dbqre') "23.1 ROT13 解码字母"
+$rt23 = 'D:\software\Qoder\Qoder.exe'
+Assert-Equal $rt23 (ConvertFrom-SuRot13 -Text (ConvertFrom-SuRot13 -Text $rt23)) "23.2 ROT13 自反（二次应用不变，数字/符号不动）"
+
+# --- 时间戳提取（Win10/11 72字节布局，偏移60 = LastExecution FILETIME；扫描所有偏移取合理值） ---
+$now23 = Get-Date '2026-09-04 12:00:00'
+$ft23  = (Get-Date '2026-09-04 09:53:49').ToFileTime()
+function New-UaData { param([long]$FileTime = 0, [int]$Offset = 60, [int]$Length = 72)
+    $b = New-Object byte[] $Length
+    if ($FileTime -gt 0) { [BitConverter]::GetBytes($FileTime).CopyTo($b, $Offset) }
+    return $b
+}
+$r23 = Get-SuUserAssistLastRun -Data (New-UaData -FileTime $ft23) -Now $now23
+Assert-Equal '2026-09-04 09:53' (Get-Date -Date $r23 -Format 'yyyy-MM-dd HH:mm') "23.3 偏移60的 FILETIME 提取（非8字节对齐）"
+$b23a = New-UaData -FileTime ((Get-Date '2039-09-16 17:33:02').ToFileTime()) -Offset 8
+[BitConverter]::GetBytes($ft23).CopyTo($b23a, 60)
+$r23a = Get-SuUserAssistLastRun -Data $b23a -Now $now23
+Assert-Equal '2026-09-04 09:53' (Get-Date -Date $r23a -Format 'yyyy-MM-dd HH:mm') "23.4 未来时间戳（2039）被排除"
+$b23b = New-UaData -FileTime ((Get-Date '2026-08-01 10:00:00').ToFileTime()) -Offset 8
+[BitConverter]::GetBytes($ft23).CopyTo($b23b, 60)
+$r23b = Get-SuUserAssistLastRun -Data $b23b -Now $now23
+Assert-Equal '2026-09-04 09:53' (Get-Date -Date $r23b -Format 'yyyy-MM-dd HH:mm') "23.5 多个合理时间戳取最大"
+Assert-Null (Get-SuUserAssistLastRun -Data (New-UaData -FileTime ((Get-Date '2009-06-01 08:00:00').ToFileTime())) -Now $now23) "23.6 2015 前的旧时间戳视为无效"
+Assert-Null (Get-SuUserAssistLastRun -Data (New-Object byte[] 4) -Now $now23) "23.7 数据过短 → null"
+
+# --- 行匹配（目录前缀 / 别名 / 快捷方式名，取最大时间） ---
+$rows23 = @(
+    [pscustomobject]@{ Name = 'Qoder';        Location = 'D:\software\Qoder\Qoder';           LastUsed = '' },
+    [pscustomobject]@{ Name = '微信';          Location = 'C:\Program Files\Tencent\WeChat';   LastUsed = '' },
+    [pscustomobject]@{ Name = 'Everything';   Location = 'D:\software\Everything';            LastUsed = '' },
+    [pscustomobject]@{ Name = 'Feishu';       Location = '';                                  LastUsed = '' },
+    [pscustomobject]@{ Name = 'Update Master'; Location = '';                                 LastUsed = '' },
+    [pscustomobject]@{ Name = 'Ghost App';    Location = '';                                  LastUsed = '' }
+)
+$ents23 = @(
+    [pscustomobject]@{ Path = 'D:\software\Qoder\Qoder\Qoder.exe'; LastRun = (Get-Date '2026-09-02 11:37:00') },
+    [pscustomobject]@{ Path = 'AlibabaCloud.Qoder';                LastRun = (Get-Date '2026-08-01 10:00:00') },
+    [pscustomobject]@{ Path = 'C:\Program Files\Tencent\WeChat\WeChat.exe'; LastRun = (Get-Date '2026-09-04 08:30:00') },
+    [pscustomobject]@{ Path = '{9E3995AB-1F9C-4F13-B827-48B24B6C7174}\TaskBar\Everything.lnk'; LastRun = (Get-Date '2026-09-03 21:00:00') },
+    [pscustomobject]@{ Path = 'Feishu';                            LastRun = (Get-Date '2026-09-01 18:00:00') },
+    [pscustomobject]@{ Path = 'C:\Windows\sysprep\update.exe';     LastRun = (Get-Date '2026-09-04 07:00:00') },
+    [pscustomobject]@{ Path = 'MSEdge';                            LastRun = (Get-Date '2026-09-04 09:53:00') },
+    [pscustomobject]@{ Path = 'X';                                 LastRun = $null }
+)
+$matched23 = Update-SuRowsLastUsed -Rows $rows23 -Entries $ents23
+$qoder23 = @($rows23 | Where-Object Name -eq 'Qoder')[0]
+$wx23    = @($rows23 | Where-Object Name -eq '微信')[0]
+$ev23    = @($rows23 | Where-Object Name -eq 'Everything')[0]
+$fs23    = @($rows23 | Where-Object Name -eq 'Feishu')[0]
+$um23    = @($rows23 | Where-Object Name -eq 'Update Master')[0]
+$gh23    = @($rows23 | Where-Object Name -eq 'Ghost App')[0]
+Assert-Equal 4 $matched23 "23.8 匹配计数（4 行命中）"
+Assert-Equal '2026-09-02 11:37' $qoder23.LastUsed "23.9 目录前缀匹配 Location，且取最大时间（晚于别名条目）"
+Assert-Equal '2026-09-04 08:30' $wx23.LastUsed    "23.10 中文名行按安装目录匹配"
+Assert-Equal '2026-09-03 21:00' $ev23.LastUsed    "23.11 快捷方式条目按名称匹配"
+Assert-Equal '2026-09-01 18:00' $fs23.LastUsed    "23.12 别名条目匹配（无安装位置行）"
+Assert-Equal '' $um23.LastUsed  "23.13 通用安装器名（update.exe）不参与名称匹配"
+Assert-Equal '' $gh23.LastUsed  "23.14 无匹配行保持为空"
+
+# --- 行缓存保留 LastUsed ---
+$cachePath23 = "$env:TEMP\su-row-cache-lu-$PID.json"
+if (Test-Path $cachePath23) { Remove-Item $cachePath23 -Force }
+Save-SuRowCache -Rows $rows23 -Path $cachePath23
+$loaded23 = Get-SuRowCache -Path $cachePath23
+Assert-Equal '2026-09-02 11:37' $loaded23.Rows[0].LastUsed "23.15 行缓存 LastUsed 字段保真"
+Remove-Item $cachePath23 -Force
+
+# --- 合并行携带 LastUsed 字段契约 ---
+$mg23 = Merge-SuSoftwareList -WingetPackages @(
+    [pscustomobject]@{ Name = 'Git'; Id = 'Git.Git'; Version = '2.50'; Available = ''; Source = 'winget' }
+) -RegistryEntries @() -Directories @() -ScanPaths @()
+Assert-True ($null -ne $mg23[0].PSObject.Properties['LastUsed']) "23.16 合并行携带 LastUsed 字段"
+Assert-Equal '' $mg23[0].LastUsed "23.17 初始为空（待枚举管线填充）"
+
 # ========== 汇总 ==========
 Write-Host ""
 Write-Host ("=" * 50)

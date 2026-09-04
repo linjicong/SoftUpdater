@@ -33,7 +33,7 @@ if (-not ('SU.SuRow' -as [type])) {
 using System.ComponentModel;
 namespace SU {
     public class SuRow : INotifyPropertyChanged {
-        bool _selected; string _name, _id, _version, _available, _catalog, _location, _status, _downloadPage, _productName; bool _hasUpdate;
+        bool _selected; string _name, _id, _version, _available, _catalog, _location, _status, _downloadPage, _productName, _lastUsed; bool _hasUpdate;
         public bool Selected { get { return _selected; } set { _selected = value; Notify("Selected"); } }
         public string Name { get { return _name; } set { _name = value; Notify("Name"); } }
         public string Id { get { return _id; } set { _id = value; Notify("Id"); } }
@@ -45,6 +45,7 @@ namespace SU {
         public bool HasUpdate { get { return _hasUpdate; } set { _hasUpdate = value; Notify("HasUpdate"); } }
         public string DownloadPage { get { return _downloadPage; } set { _downloadPage = value; Notify("DownloadPage"); } }
         public string ProductName { get { return _productName; } set { _productName = value; Notify("ProductName"); } }
+        public string LastUsed { get { return _lastUsed; } set { _lastUsed = value; Notify("LastUsed"); } }
         public event PropertyChangedEventHandler PropertyChanged;
         void Notify(string p) { var h = PropertyChanged; if (h != null) h(this, new PropertyChangedEventArgs(p)); }
     }
@@ -295,6 +296,7 @@ function ConvertTo-SuRowCollection {
         $row.HasUpdate = [bool]$r.HasUpdate
         $row.DownloadPage = [string]$r.DownloadPage
         $row.ProductName  = [string]$r.ProductName
+        $row.LastUsed     = [string]$r.LastUsed
         $row.Selected  = $false
         [void]$oc.Add($row)
     }
@@ -336,7 +338,7 @@ function Set-SuFilterMode {
 $xamlText = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="软件更新助手" Height="680" Width="1080"
+        Title="软件更新助手" Height="680" Width="1160"
         WindowStartupLocation="CenterScreen" Background="#F5F6F8"
         FontFamily="Microsoft YaHei UI" FontSize="13">
   <Window.Resources>
@@ -439,6 +441,7 @@ $xamlText = @'
         <DataGridTextColumn Header="可用版本" Binding="{Binding Available}" Width="95"  IsReadOnly="True"/>
         <DataGridTextColumn Header="来源"     Binding="{Binding Catalog}"   Width="62"  IsReadOnly="True"/>
         <DataGridTextColumn Header="位置"     Binding="{Binding Location}"  Width="*"   IsReadOnly="True"/>
+        <DataGridTextColumn Header="最近使用" Binding="{Binding LastUsed}"  Width="118" IsReadOnly="True"/>
         <DataGridTextColumn Header="状态"     Binding="{Binding Status}"    Width="105" IsReadOnly="True"/>
       </DataGrid.Columns>
       <DataGrid.ContextMenu>

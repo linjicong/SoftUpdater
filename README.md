@@ -9,11 +9,11 @@ D:\software\SoftUpdater\
 ├── 启动软件更新助手.vbs     # 双击启动（隐藏控制台，内部自动 UAC 提权）
 ├── SoftUpdater.ps1          # 桌面界面（WPF，深色主题）
 ├── SoftUpdater-Task.ps1     # 无界面入口，供计划任务调用（-Auto）
-├── SoftUpdater-Core.psm1    # 核心模块：枚举/合并/检测/升级/配置/计划任务
+├── SoftUpdater-Core.psm1    # 核心模块：枚举/合并/检测/升级/配置/计划任务/最近使用
 ├── config.json              # 配置：扫描路径、排除名单、定时开关与时间
 ├── state.json               # 上次检测/自动更新时间与结果（自动生成）
 ├── logs\                    # 按天滚动日志（UI 与定时任务共用）
-└── tests\run-tests.ps1      # 核心逻辑测试套件（51 断言，无 Pester 依赖）
+└── tests\run-tests.ps1      # 核心逻辑测试套件（134 断言，无 Pester 依赖）
 ```
 
 ## 使用
@@ -37,6 +37,14 @@ D:\software\SoftUpdater\
 4. 按 winget ID / 规范化名称去重。
 
 更新检测：`可用版本 > 当前版本`（数字段比较，兼容任意格式回退）。升级执行：`winget upgrade --id <Id> --exact --silent --accept-package-agreements --accept-source-agreements`，逐个串行、单条失败不影响后续，实时输出到日志区。
+
+## 最近使用时间（UserAssist）
+
+列表中的「最近使用」列来自 Windows 注册表 UserAssist 记录（`HKCU\...\Explorer\UserAssist`）——系统自动记录每个程序**经资源管理器/开始菜单/任务栏启动**的时间（值名 ROT13 编码，运行时间戳藏在二进制记录中，本机为 72 字节布局、偏移 60）。
+
+- 匹配规则：exe 路径落在该软件安装目录下 → 直接命中；快捷方式条目/裸别名（如 `AlibabaCloud.Qoder`）按名称宽松匹配（跳过 setup/uninstall 等通用安装器名，防误匹配）；一行取所有命中记录的最新时间；
+- 格式 `yyyy-MM-dd HH:mm`，无记录显示空；随「刷新列表」/学习/检测/定时任务一起更新，秒开缓存沿用上次值；
+- 已知局限：只统计经资源管理器/开始菜单/任务栏的启动，后台服务、命令行、应用内自更新拉起不记录；2015 年前的时间戳视为无效噪声；部分系统组件与商店应用无记录。
 
 ## 配置（config.json）
 
@@ -82,7 +90,7 @@ pwsh -NoProfile -File tests\run-tests.ps1
 
 - 程序启动即把自己设为**「低于正常」进程优先级**，winget/COM 子进程继承——刷新、更新时的 CPU 让给前台应用，整机不卡，代价是刷新本身略慢；
 - **启动秒开**：列表走缓存渲染；表格开启行虚拟化，300+ 行只物化可见行；
-- 典型耗时：脚本自身启动 ~1s；winget 枚举 ~14s（后台线程，不阻塞界面）；注册表 ~0.5s；目录扫描 ~0.3s；
+- 典型耗时：脚本自身启动 ~1s；winget 枚举 ~14s（后台线程，不阻塞界面）；注册表 ~0.5s；目录扫描 ~0.3s；最近使用记录（UserAssist 读取 ~0.3s + 行匹配 ~1.3s）；
 - 自带性能自检：UI tick 最大耗时、列表渲染耗时自动记录，渲染超 500ms 或 tick 异常会写入当天日志；
 - 各阶段耗时自动写入 `logs\` 时间戳日志，卡顿/失败时打开当天日志即可定位慢在哪一步；
 - 枚举优先走 `Microsoft.WinGet.Client` 模块（COM），未安装时自动降级 `winget list` 文本解析。
