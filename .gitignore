@@ -1,0 +1,9 @@
+# 运行时数据（机器相关，不入库）
+logs/
+state.json
+cache-rows.json
+update-sources.json
+
+# 临时/测试产物
+*.part
+*.tmp

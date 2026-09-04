@@ -1,0 +1,15 @@
+{
+  "scanPaths": [ "D:\\software" ],
+  "exclusions": [],
+  "schedule": {
+    "enabled": false,
+    "time": "12:30"
+  },
+  "portable": {
+    "checkHours": 24,
+    "downloadDir": ""
+  },
+  "cache": {
+    "maxAgeHours": 6
+  }
+}
