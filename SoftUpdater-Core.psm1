@@ -264,15 +264,30 @@ function Merge-SuSoftwareList {
         }
     }
 
-    function Find-BestWingetMatch { param($RegName, $Packages)
-        # 1) 规范化相等（含中英别名，如 微信↔WeChat、飞书↔Feishu）；2) 包含关系
-        $keys = @(Get-SuAliasKeys -Name $RegName)
-        foreach ($key in $keys) {
-            foreach ($wp in $Packages) {
-                if ((ConvertTo-SuNormalizedKey -Text $wp.Name) -eq $key) { return $wp }
-            }
+    # ---- 预计算：包规范化键等值字典 + 包含扫描数组（避免逐对正则/脚本块调用） ----
+    $pkgCount = @($WingetPackages).Count
+    $pkgNorms = New-Object 'string[]' $pkgCount
+    $pkgItems = New-Object 'object[]' $pkgCount
+    $pkgByNorm = @{}
+    $pi = 0
+    foreach ($wp in $WingetPackages) {
+        $norm = ConvertTo-SuNormalizedKey -Text "$($wp.Name)"
+        $pkgNorms[$pi] = $norm; $pkgItems[$pi] = $wp
+        if ($norm -and -not $pkgByNorm.ContainsKey($norm)) { $pkgByNorm[$norm] = $wp }
+        $pi++
+    }
+
+    function Find-BestWingetMatch { param($RegName)
+        # 1) 规范化相等（含中英别名，如 微信↔WeChat、飞书↔Feishu，字典 O(1)）；2) 包含关系（裸扫）
+        foreach ($key in (Get-SuAliasKeys -Name $RegName)) {
+            if ($key -and $pkgByNorm.ContainsKey($key)) { return $pkgByNorm[$key] }
         }
-        foreach ($wp in $Packages) { if (Test-SuNameMatch -A $wp.Name -B $RegName) { return $wp } }
+        $kn = ConvertTo-SuNormalizedKey -Text $RegName
+        for ($i = 0; $i -lt $pkgCount; $i++) {
+            $a = $pkgNorms[$i]
+            if (-not $a) { continue }
+            if (($kn.Length -ge 4 -and $a.Contains($kn)) -or ($a.Length -ge 4 -and $kn.Contains($a))) { return $pkgItems[$i] }
+        }
         return $null
     }
 
@@ -293,15 +308,17 @@ function Merge-SuSoftwareList {
     }
 
     # 2) 注册表：标注位置 / 补充系统行
+    $rowById = @{}
+    foreach ($r in $rows) { $rid = "$($r.Id)"; if ($rid -and -not $rowById.ContainsKey($rid)) { $rowById[$rid] = $r } }
     $matchedRegNames = [System.Collections.Generic.List[string]]::new()
     foreach ($reg in $RegistryEntries) {
-        $wp = Find-BestWingetMatch -RegName $reg.Name -Packages $WingetPackages
+        $wp = Find-BestWingetMatch -RegName "$($reg.Name)"
         if ($wp) {
             $matchedRegNames.Add($reg.Name)
+            $row = $rowById["$($wp.Id)"]
             if ($reg.InstallDir) {
                 foreach ($scanPath in $ScanPaths) {
                     if (Test-PathUnder -Child $reg.InstallDir -Parent $scanPath) {
-                        $row = $rows | Where-Object { $_.Id -eq $wp.Id } | Select-Object -First 1
                         if ($row -and -not $row.Location) { $row.Location = $reg.InstallDir }
                         break
                     }
@@ -309,12 +326,10 @@ function Merge-SuSoftwareList {
             }
             # 主程序 exe 名 → 供「最近使用」ExeHint 第三重匹配（位置缺失时仍可命中）
             if ($reg.ExeHint) {
-                $row = $rows | Where-Object { $_.Id -eq $wp.Id } | Select-Object -First 1
                 if ($row -and -not "$($row.ExeHint)") { $row.ExeHint = "$($reg.ExeHint)" }
             }
             # 注册表是已安装版本的权威来源：winget COM 对「应用内自更新」的软件可能返回空/过期的本地版本
             if ($reg.Version) {
-                $row = $rows | Where-Object { $_.Id -eq $wp.Id } | Select-Object -First 1
                 if ($row) {
                     $row.Version = "$($reg.Version)"
                     $row.HasUpdate = ($row.Available -and $row.Version -and ((Compare-SuVersion -A $row.Available -B $row.Version) -gt 0))
@@ -329,19 +344,33 @@ function Merge-SuSoftwareList {
 
     # 3) 目录扫描：未覆盖的绿色版
     foreach ($d in $Directories) {
+        $dfp = "$($d.FullPath)".TrimEnd('\')
         $covered = $false
         foreach ($reg in $RegistryEntries) {
-            if ($reg.InstallDir -and (Test-PathUnder -Child $d.FullPath -Parent $reg.InstallDir -or (Test-PathUnder -Child $reg.InstallDir -Parent $d.FullPath))) { $covered = $true; break }
+            $rd = "$($reg.InstallDir)".TrimEnd('\')
+            if (-not $rd) { continue }
+            if ($dfp -eq $rd -or
+                $dfp.StartsWith($rd + '\', [System.StringComparison]::OrdinalIgnoreCase) -or
+                $rd.StartsWith($dfp + '\', [System.StringComparison]::OrdinalIgnoreCase)) { $covered = $true; break }
         }
         if (-not $covered) {
-            # 目录名与 winget 行匹配 → 只标注位置
+            # 目录名与 winget 行匹配 → 只标注位置（等值字典 + 包含裸扫，语义同 Test-SuNameMatch）
+            $leaf = Split-Path -Leaf "$($d.FullPath)"
+            $kn3 = ConvertTo-SuNormalizedKey -Text $leaf
             $hit = $null
-            foreach ($wp in $WingetPackages) { if (Test-SuNameMatch -A $wp.Name -B (Split-Path -Leaf $d.FullPath)) { $hit = $wp; break } }
+            if ($kn3 -and $pkgByNorm.ContainsKey($kn3)) { $hit = $pkgByNorm[$kn3] }
+            if (-not $hit) {
+                for ($i = 0; $i -lt $pkgCount; $i++) {
+                    $a = $pkgNorms[$i]
+                    if (-not $a) { continue }
+                    if (($kn3.Length -ge 4 -and $a.Contains($kn3)) -or ($a.Length -ge 4 -and $kn3.Contains($a))) { $hit = $pkgItems[$i]; break }
+                }
+            }
             if ($hit) {
-                $row = $rows | Where-Object { $_.Id -eq $hit.Id } | Select-Object -First 1
+                $row = $rowById["$($hit.Id)"]
                 if ($row -and -not $row.Location) { $row.Location = $d.FullPath }
             } else {
-                $rows.Add((New-SuRow -Name (Split-Path -Leaf $d.FullPath) -Id '' -Version $d.ExeVersion -Available '' -Catalog '便携' -Location $d.FullPath -Status '无法检测更新' -ProductName $d.ProductName))
+                $rows.Add((New-SuRow -Name $leaf -Id '' -Version $d.ExeVersion -Available '' -Catalog '便携' -Location $d.FullPath -Status '无法检测更新' -ProductName $d.ProductName))
             }
         }
     }
