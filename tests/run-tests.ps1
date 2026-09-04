@@ -552,6 +552,48 @@ Assert-Equal '2026-09-02 11:37' $map29['qoder|d:\software\qoder\qoder'] "29.1 �
 Assert-Equal '2026-09-03 21:00' $map29['everything|d:\software\everything'] "29.2 快照映射:快捷方式名命中"
 Assert-Equal 2 $map29.Count "29.3 未命中不产生键"
 
+# ========== 30. 同名 winget 双 ARP 行合并（RustDesk 双卸载键案例） ==========
+Write-Host "`n[30] 同名 winget 行合并" -ForegroundColor Cyan
+# 真实案例：RustDesk MSI 在注册表写了友好名键 + 产品代码键，winget COM 返回两条同名 ARP 行，
+# 一条有版本、一条版本为空（被标"版本未知"）——应合并为一行
+$mg30 = Merge-SuSoftwareList -WingetPackages @(
+    [pscustomobject]@{ Name = 'RustDesk'; Id = 'ARP\Machine\X64\RustDesk'; Version = '1.4.6.29544831'; Available = ''; Source = 'winget' },
+    [pscustomobject]@{ Name = 'RustDesk'; Id = 'ARP\Machine\X64\{552ED017-461C-4DE5-8739-E04466E938FB}'; Version = ''; Available = ''; Source = 'winget' }
+) -RegistryEntries @(
+    [pscustomobject]@{ Name = 'RustDesk'; Version = '1.4.6.29544831'; InstallDir = 'D:\software\RustDesk' }
+) -Directories @() -ScanPaths @('D:\software')
+Assert-Equal 1 @($mg30).Count "30.1 双 ARP 同名行合并为一行"
+$rd30 = $mg30[0]
+Assert-Equal '1.4.6.29544831' $rd30.Version "30.2 版本取非空那条"
+Assert-Equal 'ARP\Machine\X64\RustDesk' $rd30.Id "30.3 Id 保留有版本的行（升级锚点）"
+Assert-Equal '最新' $rd30.Status "30.4 状态=最新（而非版本未知）"
+Assert-Equal 'D:\software\RustDesk' $rd30.Location "30.5 注册表位置标注仍生效"
+
+# 变体 B：空版本行在前、有版本行在后 → 仍合并且以有版本行为准
+$mg30b = Merge-SuSoftwareList -WingetPackages @(
+    [pscustomobject]@{ Name = 'AppX'; Id = 'ARP\Machine\X64\{AAAAAAAA-0000-0000-0000-000000000000}'; Version = ''; Available = ''; Source = 'winget' },
+    [pscustomobject]@{ Name = 'AppX'; Id = 'ARP\Machine\X64\AppX'; Version = '2.0'; Available = '2.1'; Source = 'winget' }
+) -RegistryEntries @() -Directories @() -ScanPaths @()
+Assert-Equal 1 @($mg30b).Count "30.6 顺序颠倒仍合并为一行"
+Assert-Equal '2.0' $mg30b[0].Version "30.7 空版本行吸收有版本行的版本"
+Assert-Equal 'ARP\Machine\X64\AppX' $mg30b[0].Id "30.8 Id 换成有版本行的"
+Assert-True $mg30b[0].HasUpdate "30.9 合并后重算 HasUpdate（2.0 → 2.1）"
+
+# 变体 C：同名但版本都非空且不同 → 真实变体，不合并
+$mg30c = Merge-SuSoftwareList -WingetPackages @(
+    [pscustomobject]@{ Name = 'AppY'; Id = 'a.AppY'; Version = '1.0'; Available = ''; Source = 'winget' },
+    [pscustomobject]@{ Name = 'AppY'; Id = 'b.AppY'; Version = '2.0'; Available = ''; Source = 'winget' }
+) -RegistryEntries @() -Directories @() -ScanPaths @()
+Assert-Equal 2 @($mg30c).Count "30.10 同名不同版本 → 保留两条不误合并"
+
+# 变体 D：同名同版本（都非空相等）→ 合并，保留先出现的行
+$mg30d = Merge-SuSoftwareList -WingetPackages @(
+    [pscustomobject]@{ Name = 'AppZ'; Id = 'z.AppZ'; Version = '3.0'; Available = ''; Source = 'winget' },
+    [pscustomobject]@{ Name = 'AppZ'; Id = 'ARP\Machine\X64\{BBBBBBBB-0000-0000-0000-000000000000}'; Version = '3.0'; Available = ''; Source = 'winget' }
+) -RegistryEntries @() -Directories @() -ScanPaths @()
+Assert-Equal 1 @($mg30d).Count "30.11 同名同版本合并为一行"
+Assert-Equal 'z.AppZ' $mg30d[0].Id "30.12 版本相等时保留先出现的行"
+
 # ========== 汇总 ==========
 Write-Host ""
 Write-Host ("=" * 50)

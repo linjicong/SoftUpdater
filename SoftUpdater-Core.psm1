@@ -300,11 +300,36 @@ function Merge-SuSoftwareList {
 
     $rows = [System.Collections.Generic.List[object]]::new()
 
-    # 1) winget 主列表
+    # 1) winget 主列表（同名行合并：RustDesk 这类 MSI 包在注册表同时有友好名键 + 产品代码键
+    #    两条卸载项，winget COM 会返回两条同名 ARP 行且其一版本为空——视为同一产品合并成一行）
+    $wingetByNorm = @{}
     foreach ($wp in $WingetPackages) {
         $ver = "$($wp.Version)"
         if (-not $ver) { $ver = Get-SuVersionFromMsixId -Id "$($wp.Id)" }   # MSIX 包版本内嵌在 Id 中
-        $rows.Add((New-SuRow -Name $wp.Name -Id $wp.Id -Version $ver -Available $wp.Available -Catalog 'winget' -Location '' -Status ''))
+        $avail = "$($wp.Available)"
+        $norm = ConvertTo-SuNormalizedKey -Text "$($wp.Name)"
+        $existing = if ($norm) { $wingetByNorm[$norm] } else { $null }
+        if ($existing) {
+            $eVer = "$($existing.Version)"
+            if ((-not $eVer) -or (-not $ver) -or ((Compare-SuVersion -A $eVer -B $ver) -eq 0)) {
+                # 同名且（版本相等或一方为空）→ 同一产品的重复 ARP 行：吸收而非新建
+                if ((-not $eVer) -and $ver) {
+                    # 已存在行版本为空、新行有版本 → 核心字段以有版本行为准（更好的升级锚点）
+                    $existing.Id = "$($wp.Id)"
+                    $existing.Version = $ver
+                    $existing.Available = $avail
+                } elseif ((-not "$($existing.Available)") -and $avail) {
+                    $existing.Available = $avail
+                }
+                if ($existing.Version -and "$($existing.Available)") {
+                    $existing.HasUpdate = (Compare-SuVersion -A $existing.Available -B $existing.Version) -gt 0
+                }
+                continue
+            }
+        }
+        $row = New-SuRow -Name $wp.Name -Id $wp.Id -Version $ver -Available $avail -Catalog 'winget' -Location '' -Status ''
+        if ($norm -and -not $wingetByNorm.ContainsKey($norm)) { $wingetByNorm[$norm] = $row }
+        $rows.Add($row)
     }
 
     # 2) 注册表：标注位置 / 补充系统行
